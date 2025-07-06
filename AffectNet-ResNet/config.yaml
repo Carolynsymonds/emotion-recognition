@@ -1,0 +1,26 @@
+# Data paths
+data: "/data/YOLO_format"
+
+train: "data/YOLO_format/train"
+val: "data/YOLO_format/valid"
+test: "data/YOLO_format/test"
+
+# Model parameters
+image_size: 256
+batch_size: 64
+num_workers: 4
+
+# Optimized Training parameters
+num_epochs: 50
+learning_rate: 1e-5         # Lower LR = slower, more stable learning (less overfitting)
+weight_decay: 0.05          # Stronger regularization to penalize overly complex models
+scheduler_step_size: 3      # Decay learning rate more frequently
+scheduler_gamma: 0.3        # Decay it more aggressively when triggered
+
+# Output settings
+checkpoint_dir: 'checkpoints'
+output_dir: 'outputs/visualizations'
+viz_frequency: 2  # Save visualization every N epochs
+
+# Custom Loss
+alpha: 0.1
