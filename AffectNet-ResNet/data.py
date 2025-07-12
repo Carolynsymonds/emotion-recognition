@@ -144,8 +144,9 @@ def get_data_loaders(config):
     # test_dataset = AffectNetDataset(config['test'])
 
     # VIEW IMAGE
-    image, label = train_dataset[0]
-    # show_image(image, label)
+    # Show 20 images from the dataset
+    images, labels = zip(*[train_dataset[i] for i in range(20)])
+    show_images_grid(images, labels, labels_map, n_cols=5)
 
     print(f'train_set: {len(train_dataset)}')
     print(f'val_set: {len(val_dataset)}')
@@ -203,12 +204,25 @@ def get_data_loaders_clip(config, device):
     val_loader = DataLoader(val_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
     return train_loader, val_loader, []
 
+def show_images_grid(images, labels, labels_map, n_cols=5, figsize=(15, 10)):
+    n_images = len(images)
+    n_rows = (n_images + n_cols - 1) // n_cols
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize)
 
+    for i, ax in enumerate(axes.flat):
+        if i < n_images:
+            img = images[i].permute(1, 2, 0).cpu().numpy()
+            img = (img - img.min()) / (img.max() - img.min())  # normalize to [0, 1]
 
-def show_image(image, label):
-    image = image.permute(1, 2, 0).cpu().numpy()
-    plt.imshow(image)
-    plt.title(f'Label: {labels_map[label]}')
-    plt.axis('off')
+            ax.imshow(img)
+            label = labels[i]
+            label_str = labels_map[str(label)] if isinstance(label, int) or isinstance(label, str) else labels_map[str(label.item())]
+            ax.set_title(f"Label: {label_str}")
+            ax.axis('off')
+        else:
+            ax.axis('off')  # Hide empty subplots
+
+    plt.tight_layout()
     plt.show()
+
 

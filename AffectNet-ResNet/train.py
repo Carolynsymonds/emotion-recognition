@@ -144,7 +144,7 @@ def validate_clip(model, val_loader, device, loss_function, text_features):
 
 if __name__ == '__main__':
 
-    train_model = "clip"
+    train_model = "efficientnet-b0"
 
     # 1 - Setup
     config = load_config('config.yaml')
