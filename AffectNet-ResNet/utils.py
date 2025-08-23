@@ -46,7 +46,6 @@ def plot_metrics(metrics_history, output_dir):
     plt.savefig(os.path.join(metrics_dir, 'accuracy_curves.png'))
     plt.close()
 
-
     # Save metrics to JSON for later analysis
-    with open(os.path.join(metrics_dir, 'metrics_history.json'), 'w') as f:
-        json.dump(metrics_history, f, indent=4)
+    # with open(os.path.join(metrics_dir, 'metrics_history.json'), 'w') as f:
+    #     json.dump(metrics_history, f, indent=4)

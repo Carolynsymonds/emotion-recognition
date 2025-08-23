@@ -14,6 +14,7 @@
 
 echo "SLURM job started"
 
+#gengpu
 # Enable flight environment
 source /opt/flight/etc/setup.sh
 flight env activate gridware
@@ -35,4 +36,4 @@ export http_proxy=http://hpc-proxy00.city.ac.uk:3128
 export TORCH_HOME=/mnt/data/public/torch
 
 # Run the script
-python -u train.py
+python -u train_baseline_freeze.py
