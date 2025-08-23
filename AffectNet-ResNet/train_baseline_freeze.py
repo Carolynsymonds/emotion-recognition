@@ -340,5 +340,5 @@ def plot():
     plot_metrics(metrics_logger.get_metrics_history(), "./checkpoints")
 
 if __name__ == '__main__':
-    # train()
-    plot()
+    train()
+    # plot()
