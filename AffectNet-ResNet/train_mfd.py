@@ -17,46 +17,8 @@ def encode_images_trainable(model, images):
     feats = model.encode_image(images)                # grads flow into last block
     feats = feats / feats.norm(dim=-1, keepdim=True)  # L2 norm
     return feats
-def encode_image_tokens_vit(model, images, require_grad=True):
-    """
-    Returns:
-      v_cls:     [B, D]        (projected CLS, normalized)
-      v_patches: [B, N, D]     (projected patches, normalized)
-    """
-    visual = model.visual  # CLIP ViT
-    x = visual.conv1(images)            # [B, C, H/patch, W/patch]
-    x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)  # [B, N, width]
-    x = torch.cat([visual.class_embedding.to(x.dtype)
-                   + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
-    x = x + visual.positional_embedding.to(x.dtype)
-    x = visual.ln_pre(x)
 
-    # Transformer (you may have un-frozen only the last block)
-    x = x.permute(1, 0, 2)  # NLD -> LND
-    x = visual.transformer(x)
-    x = x.permute(1, 0, 2)  # LND -> NLD
-
-    # ln_post then projection (apply to *all* tokens, not just CLS)
-    x = visual.ln_post(x)                      # [B, 1+N, width]
-    if hasattr(visual, "proj") and visual.proj is not None:
-        x_proj = x @ visual.proj               # [B, 1+N, D]
-    else:
-        x_proj = x
-
-    v_cls     = x_proj[:, 0, :]                # [B, D]
-    v_patches = x_proj[:, 1:, :]               # [B, N, D]
-
-    # Normalize to match text space
-    v_cls     = v_cls / v_cls.norm(dim=-1, keepdim=True)
-    v_patches = v_patches / v_patches.norm(dim=-1, keepdim=True)
-
-    if not require_grad:
-        v_cls = v_cls.detach()
-        v_patches = v_patches.detach()
-
-    return v_cls, v_patches
-
-def train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch, mfd_head):
+def train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch):
     """
     Train only the last transformer block of CLIP's visual encoder,
     using fixed text_features for zero-shot classification.
@@ -69,7 +31,6 @@ def train_epoch_last_block(train_loader, model, optimizer, criterion, device, te
     sample_logged = False
 
     scale = model.logit_scale.exp()
-    top3 = []
     print("scale", scale)
 
     for images, labels in progress_bar:
@@ -78,25 +39,43 @@ def train_epoch_last_block(train_loader, model, optimizer, criterion, device, te
 
         optimizer.zero_grad(set_to_none=True)
 
-        # get CLS + patches (normalized)
-        v_cls, v_patches = encode_image_tokens_vit(model, images, require_grad=True)  # [B,D], [B,N,D]
+        img_feats = encode_images_trainable(model, images)          # [B, D]
+        logits = scale * (img_feats @ text_features.t())
+        loss     = criterion(logits, labels)
 
-        # logits from MFD
-        logits = mfd_head(v_cls, v_patches, text_features)  # [B, C]
-        loss = criterion(logits, labels)
+        if not torch.isfinite(logits).all():
+            print("Non-finite logits! stats:",
+                  logits.min().item(), logits.max().item(), logits.mean().item(), logits.std().item())
+            print("Any NaN in img_feats:", torch.isnan(img_feats).any().item())
+            print("Any NaN in text_features:", torch.isnan(text_features).any().item())
+            optimizer.zero_grad(set_to_none=True)
+            continue
 
         if not torch.isfinite(loss):
-            print("Non-finite loss!", float(loss))
-            print("NaN in v_cls:", torch.isnan(v_cls).any().item(), "v_patches:", torch.isnan(v_patches).any().item())
+            print("Non-finite loss!", loss.item())
+            print("labels min/max:", labels.min().item(), labels.max().item(), labels.dtype)
+            optimizer.zero_grad(set_to_none=True)
             continue
 
         loss.backward()
+
+        # THIS IS FOR DEBUG
+        with torch.no_grad():
+            last_block = model.visual.transformer.resblocks[-1]
+            grad_norm_last = sum(p.grad.norm().item() for p in last_block.parameters() if p.grad is not None)
+            frozen_block = model.visual.transformer.resblocks[-2]
+            grad_norm_frozen = sum(
+                (p.grad.norm().item() if p.grad is not None else 0) for p in frozen_block.parameters())
+
+        if not sample_logged:
+            print(f"Grad Norm - Last Block: {grad_norm_last:.6f} | Frozen Block: {grad_norm_frozen:.6f}")
+        # THIS IS FOR DEBUG
+
         torch.nn.utils.clip_grad_norm_(
             [p for p in model.parameters() if p.requires_grad], 1.0
         )
         optimizer.step()
 
-        # metrics
         running_loss += loss.item() * images.size(0)
         preds = logits.argmax(dim=1)
         correct += (preds == labels).sum().item()
@@ -106,24 +85,26 @@ def train_epoch_last_block(train_loader, model, optimizer, criterion, device, te
         ema_loss = update_ema(loss.item(), ema_loss)
         ema_acc  = update_ema(batch_acc, ema_acc)
 
+        with torch.no_grad():
+            logit_mean = logits.mean().item()
+            logit_std  = logits.std().item()
+
         if not sample_logged:
-            # Grad debug (handle None grads safely)
-            last_block = model.visual.transformer.resblocks[-1]
-            grad_norm_last = sum((p.grad.norm().item() for p in last_block.parameters() if p.grad is not None), 0.0)
-            print(f"Grad Norm - Last Block: {grad_norm_last:.6f}")
-            print("Label:     ", labels[:5].tolist())
-            print("Prediction:", preds[:5].tolist())
+            print("Label:      ", labels.tolist())
+            print("Prediction: ", preds.tolist())
             top3 = torch.topk(logits, k=3, dim=1)
-            for i in range(min(5, images.size(0))):
+            for i in range(min(5, images.size(0))):  # print 5 samples
                 print(
-                    f"Top-3 idx: {top3.indices[i].tolist()} | scores: {[round(x, 3) for x in top3.values[i].tolist()]}")
+                    f"Label: {labels[i].item()}, Top-3: {top3.indices[i].tolist()}, Scores: {top3.values[i].tolist()}")
             sample_logged = True
 
         progress_bar.set_postfix({
             'loss': f'{loss.item():.3f}',
-            'ema_loss': f'{(ema_loss or 0):.3f}',
-            'ema_acc': f'{(ema_acc or 0):.2f}',
+            'ema_loss': f'{ema_loss:.3f}',
+            'ema_acc': f'{ema_acc:.2f}',
             'lr': optimizer.param_groups[0]['lr'],
+            'logμ': f'{logit_mean:.2f}',
+            'logσ': f'{logit_std:.2f}',
         })
 
     epoch_loss = running_loss / max(1, total)
@@ -135,51 +116,24 @@ def mean_class_accuracy(per_class_acc):
     # ignore NaNs if any class has 0 support
     return np.nanmean(per_class_acc)
 
-class MFDHead(torch.nn.Module):
-    def __init__(self, k=16, gamma=0.1, tau=0.07):
-        super().__init__()
-        self.k = k
-        self.gamma = gamma
-        self.tau = tau
-
-    def forward(self, v_cls, v_patches, text_features):
-        # global affinities: [B, C]
-        A_cls = torch.matmul(v_cls, text_features.T)
-
-        # local affinities: [B, N, C]
-        A_local = torch.matmul(v_patches, text_features.T)
-
-        # top-k over patches -> mean: [B, C]
-        A_local_topk = A_local.topk(self.k, dim=1).values.mean(dim=1)
-
-        # combine global & local
-        A_combined = self.gamma * A_cls + (1 - self.gamma) * A_local_topk
-
-        logits = A_combined / self.tau
-        return logits
-
 @torch.no_grad()
-def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_features, mfd_head):
+def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_features):
     """
     Evaluation for last-block fine-tuning setup.
     Uses fixed text_features for classification.
     """
     model.eval()
-    mfd_head.eval()
-
     val_loss, correct, total = 0.0, 0, 0
     all_preds, all_labels = [], []
-    with torch.inference_mode():
+    with torch.no_grad():
+        scale = model.logit_scale.exp()
         for images, labels in val_loader:
             images, labels = images.to(device), labels.to(device)
 
-            # get CLS + patches (normalized)
-            v_cls, v_patches = encode_image_tokens_vit(model, images, require_grad=True)  # [B,D], [B,N,D]
+            img_feats = encode_images_trainable(model, images)        # last block trainable
+            logits    = scale * (img_feats @ text_features.t()   )              # cosine similarity
 
-            # logits from MFD
-            logits = mfd_head(v_cls, v_patches, text_features)  # [B, C]
             loss = criterion(logits, labels)
-
             val_loss += loss.item() * images.size(0)
 
             preds = logits.argmax(dim=1)
@@ -195,12 +149,27 @@ def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_
     val_loss /= max(1, total)
     val_acc   = correct / max(1, total)
 
-    macro_f1 = f1_score(all_labels, all_preds, average='macro')
-    cm = confusion_matrix(all_labels, all_preds, labels=list(range(num_classes)))
-    per_class_acc = cm.diagonal() / cm.sum(axis=1).clip(min=1)
-    mca = mean_class_accuracy(per_class_acc)
+    # Macro-F1: ignore absent classes by default; avoid warnings
+    macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
 
-    return val_loss, val_acc, macro_f1, cm, per_class_acc, mca
+    # Confusion matrix (rows = true class)
+    cm = confusion_matrix(all_labels, all_preds, labels=np.arange(num_classes))
+    support = cm.sum(axis=1)  # samples per (true) class
+    tp = np.diag(cm).astype(float)
+
+    # Per-class accuracy with safe division (0 if support==0)
+    per_class_acc = np.divide(tp, support, out=np.zeros_like(tp), where=support > 0)
+
+    # ---- MCA that ignores empty classes ----
+    valid_mask = (support > 0)
+
+    # Optional: specifically drop Contempt (idx=7) only if it's empty
+    if num_classes > 7 and support[7] == 0:
+        valid_mask[7] = False
+
+    mca = float(per_class_acc[valid_mask].mean()) if valid_mask.any() else 0.0
+
+    return val_loss, val_acc, macro_f1, cm, per_class_acc, mca, support
 
 @torch.no_grad()
 def build_text_features_mean(by_class_prompts, model, device, emotions, batch_size=64):
@@ -257,8 +226,6 @@ def train():
     config = load_config('config.yaml')
     device = setup_device()
 
-
-
     print(f"Training for {config['num_epochs']} epochs")
     print(f"Using {config['batch_size']} mini-batch size")
     print(f"Using {config['learning_rate']} learning rate")
@@ -270,16 +237,14 @@ def train():
     # 2) -- Model: freeze CLIP completely --
     model, preprocess = clip.load("ViT-B/16", device=device)
     model.float()  # force full FP32
-
-
-    # 2.1 Freeze everything
+    for p in model.parameters():
+        p.data = p.data.float()
+    # Freeze all
     for p in model.parameters():
         p.requires_grad = False
-    model.logit_scale.requires_grad_(False)
-
-    # 2.2 Unfreeze what you want to train
-    last_block = model.visual.transformer.resblocks[-1]
-    for p in last_block.parameters():
+    model.logit_scale.requires_grad = False  # keep frozen
+    # Unfreeze only the last transformer block of the visual encoder
+    for p in model.visual.transformer.resblocks[-1].parameters():
         p.requires_grad = True
 
     # Set fixed temperature τ = 0.07
@@ -287,29 +252,21 @@ def train():
     with torch.no_grad():
         model.logit_scale.fill_(math.log(1.0 / tau))
 
-    # 2.3 Optimizer param groups (encoder vs head, with sensible WD)
-    enc_lr = config["learning_rate"]  # e.g., 5e-5 or 1e-4 | 1e-5
-    head_lr = config.get("head_lr", 1e-3)  # usually higher for heads
-    wd = config.get("weight_decay", 1e-2)
-    param_groups = [
-        {"params": last_block.parameters(), "lr": enc_lr, "weight_decay": wd},
-    ]
-
-    mfd_head = MFDHead(k=16, gamma=0.3, tau=tau).to(device)
-
-    # add MFD head (don’t forget!)
-    param_groups.append({"params": mfd_head.parameters(), "lr": head_lr, "weight_decay": wd})
-    optimizer = torch.optim.AdamW(param_groups)
+    # Freeze so it doesn't get updated
+    model.logit_scale.requires_grad_(False)
 
     # ONLY USED FOR EVAL
-    emotions = ["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry", "contemptuous"]
-    text_features = build_text_features_simple(emotions, model, device)
-    # text_features = build_text_features_mean(by_class_prompt(emotions), model, device, emotions).detach()
+    emotions = ["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"]
+    # text_features = build_text_features_simple(emotions, model, device)
+    text_features = build_text_features_mean(by_class_prompt(emotions), model, device, emotions).detach()
 
+    optimizer = torch.optim.AdamW(
+        list(model.visual.transformer.resblocks[-1].parameters()),
+        lr=config["learning_rate"],
+    )
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)  # small smoothing helps on noisy AffectNet
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
     model.to(device)
-
 
     # 4- Initialize metrics
     metrics_logger = MetricsLogger()
@@ -328,8 +285,8 @@ def train():
     for epoch in range(config['num_epochs']):
         print(f"Epoch {epoch + 1}/{config['num_epochs']}")
 
-        train_loss, train_accuracy = train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch, mfd_head)
-        val_loss, val_acc, val_f1, val_cm, val_pc, val_mca = evaluate_last_block(val_loader, model, device, criterion, config['num_classes'], text_features, mfd_head)
+        train_loss, train_accuracy = train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch)
+        val_loss, val_acc, val_f1, val_cm, val_pc, val_mca, support = evaluate_last_block(val_loader, model, device, criterion, config['num_classes'], text_features)
 
         scheduler.step(val_loss)
 
@@ -338,6 +295,7 @@ def train():
 
         print(f"Validation - Acc: {val_acc:.2%} | Macro-F1: {val_f1:.3f} | Mean Class Acc: {val_mca:.2%}")
         print("Per-class acc:", " ".join(f"{i}:{a:.2%}" for i, a in enumerate(val_pc)))
+        print("Support:", support.tolist())
 
         # Log metrics
         metrics_logger.log_epoch(
@@ -346,7 +304,8 @@ def train():
             accuracy=train_accuracy,
             val_accuracy=val_acc,
             macro_f1=val_f1,
-            mean_class_accuracy=val_mca
+            mean_class_accuracy=val_mca,
+            per_class_accuracy=[float(x) for x in val_pc]
         )
         metrics_logger.save('metrics.json')
 
