@@ -4,11 +4,11 @@ from tqdm import tqdm
 from metrics import MetricsLogger
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import clip
-import torch.nn as nn
-import torch
 from sklearn.metrics import f1_score, confusion_matrix
 import numpy as np
 from utils import load_config, setup_device, plot_metrics
+import torch
+import torch.nn as nn
 
 def update_ema(val, ema, alpha=0.1):
     return val if ema is None else (alpha * val + (1 - alpha) * ema)
@@ -196,6 +196,42 @@ def build_text_features_simple(emotions, model, device):
     text_features = model.encode_text(tokens)
     text_features = text_features / text_features.norm(dim=-1, keepdim=True)
     return text_features  # shape: [num_classes, d]
+
+class EmotionAwareAdapter(nn.Module):
+    """
+    Adapter for emotion-specific finetuning on top of a frozen CLIP ViT backbone.
+    - Only this adapter (and optionally the CLS head) are trainable.
+    - Takes CLIP's patch embeddings + class token and outputs adapted features.
+    """
+    def __init__(self, hidden_dim=768, adapter_dim=256, num_layers=2, dropout=0.1):
+        super().__init__()
+        layers = []
+        for _ in range(num_layers):
+            layers.extend([
+                nn.LayerNorm(hidden_dim),               # stabilizes training
+                nn.Linear(hidden_dim, adapter_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.Linear(adapter_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+            ])
+        self.adapter = nn.Sequential(*layers)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, N+1, hidden_dim] from CLIP visual backbone
+                - First token is CLS (global)
+                - Remaining N tokens are patch embeddings (local)
+        Returns:
+            x_adapter: [B, N+1, hidden_dim] - adapted features
+            v_cls:     [B, hidden_dim]      - adapted CLS token (global)
+            v_patches: [B, N, hidden_dim]   - adapted patch tokens (local)
+        """
+        x_adapter = self.adapter(x)
+        v_cls = x_adapter[:, 0]   # global class token embedding
+        v_patches = x_adapter[:, 1:]  # local patch embeddings
+        return x_adapter, v_cls, v_patches
 
 def by_class_prompt(emotions):
     # Classes must match label IDs 0..7

@@ -127,21 +127,21 @@ def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_
     all_preds, all_labels = [], []
     with torch.no_grad():
         scale = model.logit_scale.exp()
-    for images, labels in val_loader:
-        images, labels = images.to(device), labels.to(device)
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
 
-        img_feats = encode_images_trainable(model, images)        # last block trainable
-        logits    = scale * (img_feats @ text_features.t()   )              # cosine similarity
+            img_feats = encode_images_trainable(model, images)        # last block trainable
+            logits    = scale * (img_feats @ text_features.t()   )              # cosine similarity
 
-        loss = criterion(logits, labels)
-        val_loss += loss.item() * images.size(0)
+            loss = criterion(logits, labels)
+            val_loss += loss.item() * images.size(0)
 
-        preds = logits.argmax(dim=1)
-        correct += (preds == labels).sum().item()
-        total += labels.size(0)
+            preds = logits.argmax(dim=1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
 
-        all_preds.append(preds.cpu())
-        all_labels.append(labels.cpu())
+            all_preds.append(preds.cpu())
+            all_labels.append(labels.cpu())
 
     all_preds  = torch.cat(all_preds).numpy()
     all_labels = torch.cat(all_labels).numpy()
@@ -149,12 +149,27 @@ def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_
     val_loss /= max(1, total)
     val_acc   = correct / max(1, total)
 
-    macro_f1 = f1_score(all_labels, all_preds, average='macro')
-    cm = confusion_matrix(all_labels, all_preds, labels=list(range(num_classes)))
-    per_class_acc = cm.diagonal() / cm.sum(axis=1).clip(min=1)
-    mca = mean_class_accuracy(per_class_acc)
+    # Macro-F1: ignore absent classes by default; avoid warnings
+    macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
 
-    return val_loss, val_acc, macro_f1, cm, per_class_acc, mca
+    # Confusion matrix (rows = true class)
+    cm = confusion_matrix(all_labels, all_preds, labels=np.arange(num_classes))
+    support = cm.sum(axis=1)  # samples per (true) class
+    tp = np.diag(cm).astype(float)
+
+    # Per-class accuracy with safe division (0 if support==0)
+    per_class_acc = np.divide(tp, support, out=np.zeros_like(tp), where=support > 0)
+
+    # ---- MCA that ignores empty classes ----
+    valid_mask = (support > 0)
+
+    # Optional: specifically drop Contempt (idx=7) only if it's empty
+    if num_classes > 7 and support[7] == 0:
+        valid_mask[7] = False
+
+    mca = float(per_class_acc[valid_mask].mean()) if valid_mask.any() else 0.0
+
+    return val_loss, val_acc, macro_f1, cm, per_class_acc, mca, support
 
 @torch.no_grad()
 def build_text_features_mean(by_class_prompts, model, device, emotions, batch_size=64):
@@ -211,8 +226,6 @@ def train():
     config = load_config('config.yaml')
     device = setup_device()
 
-
-
     print(f"Training for {config['num_epochs']} epochs")
     print(f"Using {config['batch_size']} mini-batch size")
     print(f"Using {config['learning_rate']} learning rate")
@@ -243,13 +256,13 @@ def train():
     model.logit_scale.requires_grad_(False)
 
     # ONLY USED FOR EVAL
-    emotions = ["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry", "contemptuous"]
+    emotions = ["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"]
     # text_features = build_text_features_simple(emotions, model, device)
     text_features = build_text_features_mean(by_class_prompt(emotions), model, device, emotions).detach()
 
     optimizer = torch.optim.AdamW(
         list(model.visual.transformer.resblocks[-1].parameters()),
-        lr=config["learning_rate"],  # smaller for encoder
+        lr=config["learning_rate"],
     )
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)  # small smoothing helps on noisy AffectNet
     scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
@@ -273,7 +286,7 @@ def train():
         print(f"Epoch {epoch + 1}/{config['num_epochs']}")
 
         train_loss, train_accuracy = train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch)
-        val_loss, val_acc, val_f1, val_cm, val_pc, val_mca = evaluate_last_block(val_loader, model, device, criterion, config['num_classes'], text_features)
+        val_loss, val_acc, val_f1, val_cm, val_pc, val_mca, support = evaluate_last_block(val_loader, model, device, criterion, config['num_classes'], text_features)
 
         scheduler.step(val_loss)
 
@@ -282,6 +295,7 @@ def train():
 
         print(f"Validation - Acc: {val_acc:.2%} | Macro-F1: {val_f1:.3f} | Mean Class Acc: {val_mca:.2%}")
         print("Per-class acc:", " ".join(f"{i}:{a:.2%}" for i, a in enumerate(val_pc)))
+        print("Support:", support.tolist())
 
         # Log metrics
         metrics_logger.log_epoch(
@@ -291,6 +305,7 @@ def train():
             val_accuracy=val_acc,
             macro_f1=val_f1,
             mean_class_accuracy=val_mca,
+            per_class_accuracy=[float(x) for x in val_pc]
         )
         metrics_logger.save('metrics.json')
 
