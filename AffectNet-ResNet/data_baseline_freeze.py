@@ -26,47 +26,122 @@ labels_map_full = {
     4: "Fear",
     5: "Disgust",
     6: "Anger",
-    7: "Contempt",
-    8: "None",
-    9: "Uncertain",
-    10: "No-Face"
+    # 7: "Contempt",
+    # 8: "None",
+    # 9: "Uncertain",
+    # 10: "No-Face"
 }
 
 class AffectNetDatasetCLIP(data.Dataset):
-    def __init__(self, img_dir, transform):
+    def __init__(self, img_dir, transform, exclude_labels = None):
         self.img_dir = os.path.join(img_dir, "images")
         self.label_dir = os.path.join(img_dir, "annotations")
         self.transform = transform  # CLIP preprocess (expects PIL)
-        exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        self.exclude_labels = set([]) if exclude_labels is None else set(exclude_labels)
 
-        files = []
+        exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        samples = []
+
         for f in os.listdir(self.img_dir):
             name, ext = os.path.splitext(f)
-            if ext.lower() in exts:
-                if os.path.isfile(os.path.join(self.label_dir, f"{name}_exp.npy")):
-                    files.append(f)
+            if ext.lower() not in exts:
+                continue
+            lbl_path = os.path.join(self.label_dir, f"{name}_exp.npy")
+            if not os.path.isfile(lbl_path):
+                continue
 
-        self.images = sorted(files)  # deterministic order
+            lbl = int(np.load(lbl_path))
+            if lbl in self.exclude_labels:
+                continue
+
+            samples.append((f, lbl))
+
+        # deterministic order
+        samples.sort(key=lambda x: x[0])
+        self.samples = samples
 
     def __len__(self):
-        return len(self.images)
+        return len(self.samples)
 
     def __getitem__(self, idx):
-        filename = self.images[idx]
-        name = os.path.splitext(filename)[0]
-        # image -> tensor via transform
+        filename, label = self.samples[idx]
         img_path = os.path.join(self.img_dir, filename)
         image = Image.open(img_path).convert("RGB")
         if self.transform is not None:
-            image = self.transform(image)  # now a tensor [C,H,W]
+            image = self.transform(image)
+        return image, torch.tensor(label)
 
-        # label
-        label_path = os.path.join(self.label_dir, f"{name}_exp.npy")
-        label = int(np.load(label_path))
-        label = torch.tensor(label)  # convert to tensor
-
-        return image, label
 from torchvision import transforms
+import matplotlib.pyplot as plt
+from collections import Counter
+import os
+
+
+def _to_int(x):
+    # Safely convert tensor/np/int to Python int
+    try:
+        return int(x.item())  # torch / numpy scalar
+    except Exception:
+        return int(x)
+
+def plot_class_distribution(
+    dataset,
+    labels_map,
+    title="Class Distribution",
+    save_dir=None,
+    filename=None,
+    annotate_pct=True
+):
+
+    # Collect labels as ints
+    labels = [_to_int(dataset[i][1]) for i in range(len(dataset))]
+    counts = Counter(labels)
+
+    print("labels")
+
+
+    # Ensure consistent class order and include zero-count classes
+    class_ids = sorted(labels_map.keys())
+    classes = [labels_map[i] for i in class_ids]
+
+    print("classes")
+
+    values  = [counts.get(i, 0) for i in class_ids]
+    print("values")
+
+
+    # Plot
+    plt.figure(figsize=(11, 5))
+    bars = plt.bar(classes, values)
+    plt.xticks(rotation=45, ha="right")
+    plt.title(title)
+    plt.ylabel("Number of Images")
+    plt.tight_layout()
+
+    # Optional % annotations
+    if annotate_pct:
+        total = sum(values) if sum(values) > 0 else 1
+        for rect, v in zip(bars, values):
+            pct = 100.0 * v / total
+            plt.text(
+                rect.get_x() + rect.get_width()/2.0,
+                rect.get_height(),
+                f"{pct:.1f}%",
+                ha="center", va="bottom", fontsize=9
+            )
+
+    print(f"Ready to save")
+
+    # Save or show
+    if save_dir and filename:
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, filename)
+        plt.savefig(path, dpi=300)
+        print(f"Saved plot to {path}")
+        plt.close()
+    else:
+        plt.show()
+
 def get_data_loaders_clip(config, device):
 
     _, clip_preprocess = clip.load("ViT-B/16", device=device)
@@ -78,20 +153,14 @@ def get_data_loaders_clip(config, device):
     # ---- TRAIN: UA-FER-style DA(·) ----
     # random flip, rotation, random crop+scaling, blur, then normalize
     train_transform = transforms.Compose([
-        # random cropping + scaling (keeps output 224×224)
-        transforms.RandomResizedCrop(
-            size=224,
-            scale=(0.8, 1.0),
-            interpolation=transforms.InterpolationMode.BICUBIC
-        ),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomRotation(degrees=15),  # small rotation for faces
-        transforms.RandomApply(
-            [transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))],
-            p=0.2  # light blur
-        ),
+        transforms.RandomResizedCrop(224, scale=(0.85, 1.0), interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.RandomHorizontalFlip(0.5),
+        transforms.RandomRotation(15),
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.02),
+        transforms.RandomApply([transforms.GaussianBlur(3, sigma=(0.1, 2.0))], p=0.2),
         transforms.ToTensor(),
         transforms.Normalize(CLIP_MEAN, CLIP_STD),
+        transforms.RandomErasing(p=0.25, scale=(0.02, 0.08), ratio=(0.3, 3.3), value='random'),
     ])
 
     # ---- VAL/TEST: deterministic, no augmentation ----
@@ -102,8 +171,8 @@ def get_data_loaders_clip(config, device):
         transforms.Normalize(CLIP_MEAN, CLIP_STD),
     ])
 
-    train_dataset = AffectNetDatasetCLIP(config['train_full'], transform=train_transform)
-    val_dataset = AffectNetDatasetCLIP(config['val_full'], transform=val_transform)
+    train_dataset = AffectNetDatasetCLIP(config['train_full'], transform=train_transform, exclude_labels={7})
+    val_dataset = AffectNetDatasetCLIP(config['val_full'], transform=val_transform, exclude_labels={7})
 
     # 10% of train set and val set
     train_len = int(0.1 * len(train_dataset))
@@ -119,7 +188,10 @@ def get_data_loaders_clip(config, device):
     print(f'train_set - % 10: {len(train_subset)}')
     print(f'val_set - % 10: {len(val_subset)}')
 
-    train_loader = DataLoader(train_subset, batch_size=128, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_subset, batch_size=256, shuffle=False, num_workers=4)
+    print(f'training subset! data')
+
+
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=4)
 
     return train_loader, val_loader, []

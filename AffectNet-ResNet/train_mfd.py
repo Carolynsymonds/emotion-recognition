@@ -7,8 +7,9 @@ import clip
 from sklearn.metrics import f1_score, confusion_matrix
 import numpy as np
 from utils import load_config, setup_device, plot_metrics
-import torch
 import torch.nn as nn
+import torch
+import torch.nn.functional as F
 
 def update_ema(val, ema, alpha=0.1):
     return val if ema is None else (alpha * val + (1 - alpha) * ema)
@@ -18,20 +19,83 @@ def encode_images_trainable(model, images):
     feats = feats / feats.norm(dim=-1, keepdim=True)  # L2 norm
     return feats
 
-def train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch):
+
+def compute_affinities(v_cls, v_patches, text_features, temp):
+    # Normalize embeddings
+    v_cls = F.normalize(v_cls, dim=-1)          # [B, D]
+    v_patches = F.normalize(v_patches, dim=-1)  # [B, N, D]
+    text_features = F.normalize(text_features, dim=-1)  # [C, D]
+
+    # Global affinities: [B, C]
+    logits_global = torch.matmul(v_cls, text_features.t()) / temp
+
+    # Local affinities: [B, N, C]
+    logits_local = torch.matmul(v_patches, text_features.t()) / temp
+
+    # Temperature scaling and softmax along class dimension
+    affinity_global = torch.softmax(logits_global, dim=-1)  # [B, C]
+    affinity_local = torch.softmax(logits_local, dim=-1)    # [B, N, C]
+
+    return affinity_global, affinity_local
+
+def topk_local_affinity(affinity_local, k=16):
+    # affinity_local: [B, N, C], topk over N patches
+    topk_values, _ = torch.topk(affinity_local, k=k, dim=1)  # [B, k, C]
+    affinity_local_decoupled = topk_values.mean(dim=1)       # mean over top-K, shape [B, C]
+    return affinity_local_decoupled
+def combine_affinities(affinity_global, affinity_local_decoupled, gamma=0.3):
+    combined_affinity = gamma * affinity_global + (1 - gamma) * affinity_local_decoupled  # [B, C]
+    return combined_affinity
+
+def mfd_fused_logits_from_features(v_cls, v_patches, text_features, scale, k=16, gamma=0.3):
     """
-    Train only the last transformer block of CLIP's visual encoder,
-    using fixed text_features for zero-shot classification.
+    v_cls:     [B, D]    (CLS after adapter; D=512 in your setup)
+    v_patches: [B, N, D] (patch tokens after adapter)
+    text_features: [C, D] (L2-normalized)
+    scale: CLIP logit scale, i.e., model.logit_scale.exp()
+    returns: fused logits [B, C] suitable for CrossEntropyLoss
     """
-    model.train()
+    # L2-normalize visual features (text already normalized)
+    v_cls     = F.normalize(v_cls, dim=-1)
+    v_patches = F.normalize(v_patches, dim=-1)
+    t         = F.normalize(text_features, dim=-1)
+
+    # Global logits (standard CLIP): scale * cosine
+    logits_cls = scale * (v_cls @ t.t())                                # [B, C]
+
+    # Local logits per patch
+    logits_loc = scale * (v_patches @ t.t().unsqueeze(0))               # [B, N, C]
+
+    # Per-patch class probs, then Top-K over patches per class
+    A_loc = torch.softmax(logits_loc, dim=-1)        # [B, N, C]
+    A_loc_bcn = A_loc.permute(0, 2, 1)               # [B, C, N]
+    k_eff = min(k, A_loc_bcn.shape[-1])
+    topk_vals = torch.topk(A_loc_bcn, k=k_eff, dim=2).values            # [B, C, k]
+    A_loc_mean = topk_vals.mean(dim=2).clamp_min(1e-8)                  # [B, C]
+
+    # Fuse in logit space (numerically stable): logits + log(prob)
+    fused_logits = gamma * logits_cls + (1.0 - gamma) * torch.log(A_loc_mean)
+    return fused_logits
+def project_visual_tokens(clip_model, tokens_768):
+    x = clip_model.visual.ln_post(tokens_768)
+    if clip_model.visual.proj is not None:
+        x = x @ clip_model.visual.proj
+    return x
+def train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch, adapter, scheduler, gamma, k):
+    """
+     Train the Emotion-aware Adapter on top of frozen CLIP visual encoder.
+    Use fixed text_features for classification.
+    """
+    model.eval()  # Freeze CLIP backbone in eval mode
+    adapter.train()  # Train adapter
+
     running_loss, correct, total = 0.0, 0, 0
     ema_loss, ema_acc = None, None
 
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}")
     sample_logged = False
-
-    scale = model.logit_scale.exp()
-    print("scale", scale)
+    scale2 = model.logit_scale.exp()
+    print("Logit scale (TO TEST):", scale2.item())
 
     for images, labels in progress_bar:
         images = images.to(device, non_blocking=True).float()
@@ -39,25 +103,39 @@ def train_epoch_last_block(train_loader, model, optimizer, criterion, device, te
 
         optimizer.zero_grad(set_to_none=True)
 
-        img_feats = encode_images_trainable(model, images)          # [B, D]
-        logits = scale * (img_feats @ text_features.t())
-        loss     = criterion(logits, labels)
+        with torch.no_grad():
+            patch_tokens_768 = extract_patch_tokens(model, images)  # [B, N+1, 768]
 
-        if not torch.isfinite(logits).all():
-            print("Non-finite logits! stats:",
-                  logits.min().item(), logits.max().item(), logits.mean().item(), logits.std().item())
-            print("Any NaN in img_feats:", torch.isnan(img_feats).any().item())
-            print("Any NaN in text_features:", torch.isnan(text_features).any().item())
-            optimizer.zero_grad(set_to_none=True)
-            continue
+        projected_tokens = project_visual_tokens(model, patch_tokens_768).to(device)  # [B, N+1, 512]
 
-        if not torch.isfinite(loss):
-            print("Non-finite loss!", loss.item())
-            print("labels min/max:", labels.min().item(), labels.max().item(), labels.dtype)
-            optimizer.zero_grad(set_to_none=True)
-            continue
+        # Step 1: Forward pass through adapter to get CLS and patch embeddings
+        tokens = adapter(projected_tokens)  # [B, N+1, 512]
+        v_cls = tokens[:, 0, :]  # [B, 512]
+        v_patches = tokens[:, 1:, :]  # [B, N, 512]
+
+        # Step 2: Compute affinities
+        # temp = scale
+        # affinity_global, affinity_local = compute_affinities(v_cls, v_patches, text_features, temp)
+        scale = model.logit_scale.exp()
+        logits = mfd_fused_logits_from_features(v_cls, v_patches, text_features, scale, k=k, gamma=gamma)
+
+        # Step 3: Decouple local affinities
+        # affinity_local_decoupled = topk_local_affinity(affinity_local, k=16)
+
+        # Step 4: Combine global and local affinities
+        # gamma = 0.3  # or dataset-dependent value
+        # combined_logits = combine_affinities(affinity_global, affinity_local_decoupled, gamma)
+
+        # Step 5: Compute loss on combined affinity logits (convert back if needed)
+        # epsilon = 1e-8
+        loss = criterion(logits, labels)
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)  # Grad clipping on adapter params
+        optimizer.step()
+
+        if scheduler is not None:
+            scheduler.step()  # <-- per batch, no args
 
         # THIS IS FOR DEBUG
         with torch.no_grad():
@@ -71,11 +149,6 @@ def train_epoch_last_block(train_loader, model, optimizer, criterion, device, te
             print(f"Grad Norm - Last Block: {grad_norm_last:.6f} | Frozen Block: {grad_norm_frozen:.6f}")
         # THIS IS FOR DEBUG
 
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in model.parameters() if p.requires_grad], 1.0
-        )
-        optimizer.step()
-
         running_loss += loss.item() * images.size(0)
         preds = logits.argmax(dim=1)
         correct += (preds == labels).sum().item()
@@ -85,26 +158,20 @@ def train_epoch_last_block(train_loader, model, optimizer, criterion, device, te
         ema_loss = update_ema(loss.item(), ema_loss)
         ema_acc  = update_ema(batch_acc, ema_acc)
 
-        with torch.no_grad():
-            logit_mean = logits.mean().item()
-            logit_std  = logits.std().item()
-
         if not sample_logged:
-            print("Label:      ", labels.tolist())
-            print("Prediction: ", preds.tolist())
+            print("Sample labels:", labels[:5].tolist())
+            print("Sample predictions:", preds[:5].tolist())
             top3 = torch.topk(logits, k=3, dim=1)
-            for i in range(min(5, images.size(0))):  # print 5 samples
+            for i in range(min(5, images.size(0))):
                 print(
-                    f"Label: {labels[i].item()}, Top-3: {top3.indices[i].tolist()}, Scores: {top3.values[i].tolist()}")
+                    f"Label: {labels[i].item()}, Top-3 classes: {top3.indices[i].tolist()}, Scores: {top3.values[i].tolist()}")
             sample_logged = True
 
         progress_bar.set_postfix({
             'loss': f'{loss.item():.3f}',
             'ema_loss': f'{ema_loss:.3f}',
             'ema_acc': f'{ema_acc:.2f}',
-            'lr': optimizer.param_groups[0]['lr'],
-            'logμ': f'{logit_mean:.2f}',
-            'logσ': f'{logit_std:.2f}',
+            'lr': optimizer.param_groups[0]['lr']
         })
 
     epoch_loss = running_loss / max(1, total)
@@ -117,56 +184,59 @@ def mean_class_accuracy(per_class_acc):
     return np.nanmean(per_class_acc)
 
 @torch.no_grad()
-def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_features):
+def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_features, adapter, gamma, k):
     """
     Evaluation for last-block fine-tuning setup.
     Uses fixed text_features for classification.
     """
     model.eval()
-    val_loss, correct, total = 0.0, 0, 0
+    adapter.eval()
+
+    assert text_features.size(0) == num_classes, \
+        f"num_classes ({num_classes}) must match text_features.size(0) ({text_features.size(0)})"
+    text_features = text_features.to(device)
+
+    val_loss = 0.0
+    correct = total = 0
     all_preds, all_labels = [], []
-    with torch.no_grad():
-        scale = model.logit_scale.exp()
-        for images, labels in val_loader:
-            images, labels = images.to(device), labels.to(device)
 
-            img_feats = encode_images_trainable(model, images)        # last block trainable
-            logits    = scale * (img_feats @ text_features.t()   )              # cosine similarity
+    scale = model.logit_scale.exp()  # scalar tensor
 
-            loss = criterion(logits, labels)
-            val_loss += loss.item() * images.size(0)
+    for images, labels in val_loader:
+        images, labels = images.to(device), labels.to(device)
 
-            preds = logits.argmax(dim=1)
-            correct += (preds == labels).sum().item()
-            total += labels.size(0)
+        tokens_768 = extract_patch_tokens(model, images)  # [B, N+1, 768]
+        tokens_512 = project_visual_tokens(model, tokens_768)  # [B, N+1, 512]
 
-            all_preds.append(preds.cpu())
-            all_labels.append(labels.cpu())
+        tokens = adapter(tokens_512)  # [B, N+1, 512]
+        v_cls, v_patches = tokens[:, 0, :], tokens[:, 1:, :]  # [B, 512], [B, N, 512]
 
-    all_preds  = torch.cat(all_preds).numpy()
+        logits = mfd_fused_logits_from_features(v_cls, v_patches, text_features, scale, k=k, gamma=gamma)
+        loss = criterion(logits, labels)
+
+        val_loss += loss.item() * images.size(0)
+        preds = logits.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total += labels.size(0)
+
+        all_preds.append(preds.cpu())
+        all_labels.append(labels.cpu())
+
+    all_preds = torch.cat(all_preds).numpy()
     all_labels = torch.cat(all_labels).numpy()
 
     val_loss /= max(1, total)
-    val_acc   = correct / max(1, total)
+    val_acc = correct / max(1, total)
 
-    # Macro-F1: ignore absent classes by default; avoid warnings
     macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
-
-    # Confusion matrix (rows = true class)
     cm = confusion_matrix(all_labels, all_preds, labels=np.arange(num_classes))
-    support = cm.sum(axis=1)  # samples per (true) class
+    support = cm.sum(axis=1)
     tp = np.diag(cm).astype(float)
 
-    # Per-class accuracy with safe division (0 if support==0)
     per_class_acc = np.divide(tp, support, out=np.zeros_like(tp), where=support > 0)
-
-    # ---- MCA that ignores empty classes ----
     valid_mask = (support > 0)
-
-    # Optional: specifically drop Contempt (idx=7) only if it's empty
     if num_classes > 7 and support[7] == 0:
         valid_mask[7] = False
-
     mca = float(per_class_acc[valid_mask].mean()) if valid_mask.any() else 0.0
 
     return val_loss, val_acc, macro_f1, cm, per_class_acc, mca, support
@@ -198,40 +268,21 @@ def build_text_features_simple(emotions, model, device):
     return text_features  # shape: [num_classes, d]
 
 class EmotionAwareAdapter(nn.Module):
-    """
-    Adapter for emotion-specific finetuning on top of a frozen CLIP ViT backbone.
-    - Only this adapter (and optionally the CLS head) are trainable.
-    - Takes CLIP's patch embeddings + class token and outputs adapted features.
-    """
-    def __init__(self, hidden_dim=768, adapter_dim=256, num_layers=2, dropout=0.1):
+    def __init__(self, hidden_dim=512, adapter_dim=128, num_layers=2, dropout=0.2):
         super().__init__()
         layers = []
         for _ in range(num_layers):
-            layers.extend([
-                nn.LayerNorm(hidden_dim),               # stabilizes training
+            layers += [
+                nn.LayerNorm(hidden_dim),
                 nn.Linear(hidden_dim, adapter_dim),
-                nn.ReLU(inplace=True),
-                nn.Dropout(dropout),
+                nn.GELU(),
+                nn.Dropout(dropout),          # <-- add dropout
                 nn.Linear(adapter_dim, hidden_dim),
-                nn.ReLU(inplace=True),
-            ])
+            ]
         self.adapter = nn.Sequential(*layers)
 
     def forward(self, x):
-        """
-        Args:
-            x: [B, N+1, hidden_dim] from CLIP visual backbone
-                - First token is CLS (global)
-                - Remaining N tokens are patch embeddings (local)
-        Returns:
-            x_adapter: [B, N+1, hidden_dim] - adapted features
-            v_cls:     [B, hidden_dim]      - adapted CLS token (global)
-            v_patches: [B, N, hidden_dim]   - adapted patch tokens (local)
-        """
-        x_adapter = self.adapter(x)
-        v_cls = x_adapter[:, 0]   # global class token embedding
-        v_patches = x_adapter[:, 1:]  # local patch embeddings
-        return x_adapter, v_cls, v_patches
+        return x + self.adapter(x)
 
 def by_class_prompt(emotions):
     # Classes must match label IDs 0..7
@@ -255,12 +306,52 @@ def by_class_prompt(emotions):
         by_class[e] = variants
 
     return by_class
+def extract_patch_tokens(clip_model, images):
+    """
+    Extract patch tokens (including CLS token) from the visual transformer.
 
-import math
+    Args:
+        clip_model: The loaded CLIP model with ViT visual backbone.
+        images: Preprocessed images tensor [B, 3, H, W] on same device as model.
+
+    Returns:
+        tokens: Tensor of shape [B, N+1, hidden_dim] containing CLS + patch tokens.
+    """
+    v = clip_model.visual
+
+    # Move images type to match model weights
+    x = images.to(dtype=v.conv1.weight.dtype)
+
+    # Patch embedding with conv1
+    x = v.conv1(x)  # Shape: [B, 768, H/16, W/16]
+
+    # Flatten spatial dimensions to tokens sequence
+    x = x.reshape(x.shape[0], x.shape[1], -1).permute(0, 2, 1)  # [B, N, 768]
+
+    # Add class token to start of tokens sequence
+    cls = v.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[2], device=x.device, dtype=x.dtype)  # [B,1,768]
+    x = torch.cat([cls, x], dim=1)  # [B, N+1, 768]
+
+    # Add positional embeddings
+    x = x + v.positional_embedding.to(x.dtype)
+
+    # Apply pre-transformer LayerNorm
+    x = v.ln_pre(x)
+
+    # Pass through transformer blocks (sequencing of residual attention blocks)
+    x = v.transformer(x.permute(1, 0, 2))  # Permute to [seq_len, batch, dim]
+    x = x.permute(1, 0, 2)  # Back to [B, seq_len, dim]
+
+    # Now x contains patch tokens and CLS token embeddings
+    return x
+
 def train():
     # -- Setup --
     config = load_config('config.yaml')
     device = setup_device()
+
+    gamma = config.get("gamma", 0.4)
+    k = config.get("topk", 24)
 
     print(f"Training for {config['num_epochs']} epochs")
     print(f"Using {config['batch_size']} mini-batch size")
@@ -272,36 +363,53 @@ def train():
 
     # 2) -- Model: freeze CLIP completely --
     model, preprocess = clip.load("ViT-B/16", device=device)
+
     model.float()  # force full FP32
     for p in model.parameters():
         p.data = p.data.float()
     # Freeze all
     for p in model.parameters():
         p.requires_grad = False
-    model.logit_scale.requires_grad = False  # keep frozen
-    # Unfreeze only the last transformer block of the visual encoder
-    for p in model.visual.transformer.resblocks[-1].parameters():
-        p.requires_grad = True
+    # model.logit_scale.requires_grad = False  # keep frozen
+    # # Unfreeze only the last transformer block of the visual encoder
+    # for p in model.visual.transformer.resblocks[-1].parameters():
+    #     p.requires_grad = True
+
+    adapter = EmotionAwareAdapter(hidden_dim=512, adapter_dim=256, num_layers=2, dropout=0.2)
+    for param in adapter.parameters():
+        param.requires_grad = True
+
+    adapter.to(device)
 
     # Set fixed temperature τ = 0.07
-    tau = 0.07
+    import math
     with torch.no_grad():
-        model.logit_scale.fill_(math.log(1.0 / tau))
-
-    # Freeze so it doesn't get updated
+        model.logit_scale.fill_(math.log(1.0 / 0.07))  # ≈ 14.29
     model.logit_scale.requires_grad_(False)
+    optimizer = torch.optim.AdamW(adapter.parameters(), lr=1e-4, weight_decay=1e-4)
+
+    print("logit_scale.exp =", model.logit_scale.exp().item())
 
     # ONLY USED FOR EVAL
     emotions = ["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"]
     # text_features = build_text_features_simple(emotions, model, device)
-    text_features = build_text_features_mean(by_class_prompt(emotions), model, device, emotions).detach()
+    text_features = build_text_features_mean(by_class_prompt(emotions), model, device, emotions)
+    text_features = text_features.detach().to(device)  # move to GPU/CPU once
 
-    optimizer = torch.optim.AdamW(
-        list(model.visual.transformer.resblocks[-1].parameters()),
-        lr=config["learning_rate"],
-    )
     criterion = nn.CrossEntropyLoss(label_smoothing=0.05)  # small smoothing helps on noisy AffectNet
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+
+    steps_per_epoch = len(train_loader)
+    total_steps = steps_per_epoch * config['num_epochs']
+    warmup_steps = max(1, int(0.1 * total_steps))
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return float(step) / warmup_steps
+        prog = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * prog))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
     model.to(device)
 
     # 4- Initialize metrics
@@ -316,15 +424,16 @@ def train():
 
     # 5 - Training loop
     best_val_loss = float('inf')
+    best_mca = -float('inf')
     patience = 5
     early_stopping_counter = 0
     for epoch in range(config['num_epochs']):
         print(f"Epoch {epoch + 1}/{config['num_epochs']}")
 
-        train_loss, train_accuracy = train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch)
-        val_loss, val_acc, val_f1, val_cm, val_pc, val_mca, support = evaluate_last_block(val_loader, model, device, criterion, config['num_classes'], text_features)
+        train_loss, train_accuracy = train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch, adapter, scheduler, gamma, k)
+        val_loss, val_acc, val_f1, val_cm, val_pc, val_mca, support = evaluate_last_block(val_loader, model, device, criterion, config['num_classes'], text_features, adapter, gamma, k)
 
-        scheduler.step(val_loss)
+        print("Current LR:", scheduler.get_last_lr()[0])
 
         print(f"\nEpoch {epoch + 1}/{config['num_epochs']}:")
         print(f"Training   - Loss: {train_loss:.4f} | Acc: {train_accuracy:.2%}")
@@ -345,15 +454,18 @@ def train():
         )
         metrics_logger.save('metrics.json')
 
-        print(f'best val loss: {best_val_loss:.4f}')
-        print(f'val loss: {val_loss:.4f}')
+        print(f'best_mca: {best_mca:.4f}')
+        print(f'val_mca: {val_mca:.4f}')
 
-        # Save best model (by val_loss)
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # Save best model (by val_mca)
+        monitor = val_mca
+
+        if monitor > best_mca:
+            best_mca = monitor
             early_stopping_counter = 0
             ckpt = {
                 'epoch': epoch + 1,
+                'adapter_state_dict': adapter.state_dict(),  # <-- add this
                 'model_state_dict': model.state_dict(),  # CLIP (frozen)
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_loss': val_loss,
@@ -362,6 +474,7 @@ def train():
                 "val_mean_class_acc": float(val_mca),
                 "per_class_acc": [float(x) for x in val_pc],
                 'config': config,
+                'best_mca': float(best_mca)
             }
             torch.save(ckpt, f"{config['checkpoint_dir']}/best_model.pth")
             print('Saved Best Model!')
@@ -376,6 +489,7 @@ def train():
         'epoch': epoch + 1,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
+        'adapter_state_dict': adapter.state_dict(),   # <-- add this
         'val_loss': val_loss,
         'val_acc': float(val_acc),
         'val_macro_f1': float(val_f1),
