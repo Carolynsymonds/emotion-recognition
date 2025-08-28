@@ -76,6 +76,7 @@ def mfd_fused_logits_from_features(v_cls, v_patches, text_features, scale, k=16,
     # Fuse in logit space (numerically stable): logits + log(prob)
     fused_logits = gamma * logits_cls + (1.0 - gamma) * torch.log(A_loc_mean)
     return fused_logits
+
 def project_visual_tokens(clip_model, tokens_768):
     x = clip_model.visual.ln_post(tokens_768)
     if clip_model.visual.proj is not None:
@@ -260,12 +261,22 @@ def build_text_features_mean(by_class_prompts, model, device, emotions, batch_si
     return torch.stack(class_feats, dim=0)  # [num_classes, d]
 
 @torch.no_grad()
-def build_text_features_simple(emotions, model, device):
-    """Tokenizes and encodes each emotion label as a CLIP text embedding."""
+def build_text_features_simple(emotions, model, device, dtype=torch.float32):
+    """
+    Returns a [num_classes, d] matrix of L2-normalized CLIP text features
+    for the given class labels (one prompt per class).
+    """
+    # model should already be on device; eval() is harmless if called again
+    model.eval()
+
+    # tokenize -> encode
     tokens = clip.tokenize(emotions).to(device)
-    text_features = model.encode_text(tokens)
-    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-    return text_features  # shape: [num_classes, d]
+    text_features = model.encode_text(tokens).to(dtype=dtype)
+
+    # L2 normalize with numerical safety
+    text_features = text_features / text_features.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+
+    return text_features  # shape: [num_classes, d], typically d=512
 
 class EmotionAwareAdapter(nn.Module):
     def __init__(self, hidden_dim=512, adapter_dim=128, num_layers=2, dropout=0.2):
@@ -345,13 +356,32 @@ def extract_patch_tokens(clip_model, images):
     # Now x contains patch tokens and CLS token embeddings
     return x
 
+import torch
+from torch.utils.data import DataLoader, WeightedRandomSampler
+
+def compute_class_counts(train_loader, num_classes: int) -> torch.Tensor:
+    """Count labels from the *training* loader on CPU with safe dtypes."""
+    counts = torch.zeros(num_classes, dtype=torch.long)
+    for _, y in train_loader:
+        y = y.to('cpu', non_blocking=True).long()
+        counts += torch.bincount(y, minlength=num_classes)
+    return counts
+
+def make_class_weights(counts: torch.Tensor, cap: float = 10.0) -> torch.Tensor:
+    """Inverse-frequency weights, normalized & capped for stability."""
+    counts = counts.clamp(min=1)  # avoid div-by-zero if a class is absent
+    w = counts.sum().float() / counts.float()        # inverse freq
+    w = (w / w.mean()).clamp(max=cap)               # normalize & cap
+    return w
+
+
 def train():
     # -- Setup --
     config = load_config('config.yaml')
     device = setup_device()
 
-    gamma = config.get("gamma", 0.4)
-    k = config.get("topk", 24)
+    gamma = config.get("gamma", 0.3)
+    k = config.get("topk", 16)
 
     print(f"Training for {config['num_epochs']} epochs")
     print(f"Using {config['batch_size']} mini-batch size")
@@ -390,13 +420,27 @@ def train():
 
     print("logit_scale.exp =", model.logit_scale.exp().item())
 
-    # ONLY USED FOR EVAL
     emotions = ["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"]
     # text_features = build_text_features_simple(emotions, model, device)
     text_features = build_text_features_mean(by_class_prompt(emotions), model, device, emotions)
     text_features = text_features.detach().to(device)  # move to GPU/CPU once
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)  # small smoothing helps on noisy AffectNet
+    num_classes = config["num_classes"]
+    # 1) Count labels on CPU (full train set)
+    counts = compute_class_counts(train_loader, num_classes)  # returns cpu long tensor
+    print("Train class counts:", counts.tolist())
+
+    # 2) Stable inverse-frequency weights (normalized & capped)
+    class_weights = make_class_weights(counts, cap=10.0).to(device)
+    print("CE class weights:", class_weights.detach().cpu().tolist())
+
+    # 3) Weighted CE
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=0.01  # keep small when using weights
+    )
+
+    # criterion = nn.CrossEntropyLoss(label_smoothing=0.05)  # small smoothing helps on noisy AffectNet
 
     steps_per_epoch = len(train_loader)
     total_steps = steps_per_epoch * config['num_epochs']
@@ -417,9 +461,10 @@ def train():
 
 
     # THIS IS FOR DEBUG
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    frozen_params = sum(p.numel() for p in model.parameters() if not p.requires_grad)
-    print(f"Trainable params: {trainable_params:,} | Frozen params: {frozen_params:,}")
+    model_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    adapter_trainable = sum(p.numel() for p in adapter.parameters() if p.requires_grad)
+    print(f"Trainable (adapter): {adapter_trainable:,} | Trainable (model): {model_trainable:,} | "
+          f"Frozen (model): {sum(p.numel() for p in model.parameters() if not p.requires_grad):,}")
     #THIS IS FOR DEBUG
 
     # 5 - Training loop

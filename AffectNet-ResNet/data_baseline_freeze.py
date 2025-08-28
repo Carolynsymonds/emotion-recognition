@@ -188,10 +188,9 @@ def get_data_loaders_clip(config, device):
     print(f'train_set - % 10: {len(train_subset)}')
     print(f'val_set - % 10: {len(val_subset)}')
 
-    print(f'training subset! data')
+    print(f'training dataa! data')
 
-
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_subset, batch_size=256, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_subset, batch_size=256, shuffle=False, num_workers=4)
 
     return train_loader, val_loader, []
