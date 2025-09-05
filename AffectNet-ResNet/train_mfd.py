@@ -383,10 +383,10 @@ def train():
     gamma = config.get("gamma", 0.3)
     k = config.get("topk", 16)
 
+    print(f"Training for gamma {gamma} and topk {k} ")
     print(f"Training for {config['num_epochs']} epochs")
     print(f"Using {config['batch_size']} mini-batch size")
     print(f"Using {config['learning_rate']} learning rate")
-
 
     # 1) -- Data --
     train_loader, val_loader, test_loader = get_data_loaders_clip(config, device)
@@ -542,13 +542,64 @@ def train():
         'per_class_acc': [float(x) for x in val_pc],
         'config': config,
     }, f"{config['checkpoint_dir']}/last.pth")
+import matplotlib.pyplot as plt
+
+from data_baseline_freeze import labels_map_full
+
+def plot_per_class_accuracy(per_class_accuracy, class_labels=None, title="Per-class Accuracy over Epochs"):
+    """
+    Plot per-class accuracy across epochs.
+
+    Parameters
+    ----------
+    per_class_accuracy : list[list[float]]
+        A list of epochs, each containing a list of per-class accuracies,
+        e.g. shape [num_epochs][num_classes].
+    class_labels : list[str] or None
+        Optional list of class names (length = num_classes). If None, classes are indexed.
+    title : str
+        Plot title.
+    """
+    if not per_class_accuracy:
+        raise ValueError("per_class_accuracy is empty.")
+
+    num_epochs = len(per_class_accuracy)
+    num_classes = len(per_class_accuracy[0])
+    for i, ep in enumerate(per_class_accuracy):
+        if len(ep) != num_classes:
+            raise ValueError(f"Epoch {i} has {len(ep)} classes, expected {num_classes}.")
+
+    if class_labels is None:
+        class_labels = [f"Class {i+1}" for i in range(num_classes)]
+    elif len(class_labels) != num_classes:
+        raise ValueError(f"class_labels length {len(class_labels)} != num_classes {num_classes}.")
+
+    epochs = list(range(1, num_epochs + 1))
+
+    plt.figure(figsize=(8, 5))
+    for class_idx in range(num_classes):
+        series = [epoch_vals[class_idx] for epoch_vals in per_class_accuracy]
+        plt.plot(epochs, series, marker='o', label=class_labels[class_idx])
+
+    plt.title(title)
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.ylim(0, 1.0)
+    plt.xticks(epochs)
+    plt.legend(loc="best")
+    plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
+    plt.tight_layout()
+    plt.show()
 
 def plot():
     metrics_logger = MetricsLogger()
-    metrics_logger.load("./metrics.json")
+    metrics_logger.load("./history-3/baseline-no-contempt/metrics.json")
 
+
+    metrics_history = metrics_logger.get_metrics_history()
+    plot_per_class_accuracy(metrics_history["per_class_accuracy"], labels_map_full)
     plot_metrics(metrics_logger.get_metrics_history(), "./checkpoints")
 
 if __name__ == '__main__':
-    train()
-    # plot()
+    # train()
+    plot()
