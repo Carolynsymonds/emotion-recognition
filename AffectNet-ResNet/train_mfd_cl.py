@@ -114,7 +114,87 @@ def tensor_stats(x, name, k=3):
         f'{name}_max': float(x_det[finite].max().item()) if finite.any() else float('nan'),
         f'{name}_mean': float(x_det[finite].mean().item()) if finite.any() else float('nan'),
     }
-def train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch, adapter, scheduler, gamma, k,  alpha=0.2, beta=0.1, itc_temp=0.07, k_itc=None):
+import torch
+import torch.nn.functional as F
+
+class MultiPositiveContrastiveLoss(torch.nn.Module):
+    """
+    Multi-positive CLIP-style contrastive loss.
+
+    Args:
+        temperature (float): softmax temperature (tau). We scale logits by 1/tau.
+        symmetric (bool): if True, compute image->text and text->image losses and average.
+        pos_weight (float or None): optional BCE positive weight to counter class imbalance.
+
+    Forward inputs:
+        img_embeds: (B, D) L2-normalized or will be normalized here
+        txt_embeds: (M, D) where M = sum_i P_i (total captions/text for the batch images)
+        pos_index:  list/tuple length B. pos_index[i] is a 1D LongTensor of indices into txt_embeds
+                    indicating which texts belong to image i (can be variable #positives per image).
+    """
+    def __init__(self, temperature=0.07, symmetric=True, pos_weight=None):
+        super().__init__()
+        self.tau = temperature
+        self.symmetric = symmetric
+        self.register_buffer("pos_weight_tensor",
+                             torch.tensor(pos_weight) if pos_weight is not None else None)
+
+    def forward(self, img_embeds, txt_embeds, pos_index):
+        # Normalize (safe if already normalized)
+        img = F.normalize(img_embeds, dim=-1)
+        txt = F.normalize(txt_embeds, dim=-1)
+
+        # Similarity matrix S = img @ txt^T -> (B, M)
+        logits = (img @ txt.t()) / self.tau   # (B, M)
+
+        # Build multi-hot target matrix Y of shape (B, M)
+        B, M = logits.shape
+        device = logits.device
+        targets = torch.zeros((B, M), dtype=torch.float32, device=device)
+        for i, idx in enumerate(pos_index):
+            targets[i, idx.to(device)] = 1.0
+
+        # BCE-with-logits row-wise: image->text
+        # Optionally weight positives to balance (far fewer positives than negatives)
+        if self.pos_weight_tensor is not None:
+            pos_w = self.pos_weight_tensor.to(device)
+            loss_i2t = F.binary_cross_entropy_with_logits(
+                logits, targets, pos_weight=pos_w, reduction="mean"
+            )
+        else:
+            loss_i2t = F.binary_cross_entropy_with_logits(logits, targets, reduction="mean")
+
+        if not self.symmetric:
+            return loss_i2t
+
+        # Symmetric term: text->image
+        # Build targets^T : (M, B). We need mapping from each text to its owning image.
+        # Derive inverse mapping from pos_index
+        # For each image i, for each text idx in pos_index[i], text2img[idx] = i
+        text2img = torch.full((M,), -1, dtype=torch.long, device=device)
+        for i, idx in enumerate(pos_index):
+            text2img[idx.to(device)] = i
+        assert (text2img >= 0).all(), "Every text must map to exactly one image"
+
+        # logits_t2i: (M, B) = txt @ img^T / tau (or just logits.T)
+        logits_t2i = logits.t()  # (M, B)
+
+        # targets_t2i: one-hot over images for each text
+        targets_t2i = F.one_hot(text2img, num_classes=B).to(torch.float32)  # (M, B)
+
+        if self.pos_weight_tensor is not None:
+            # Here, positives per row = 1; pos_weight still ok to keep symmetry
+            loss_t2i = F.binary_cross_entropy_with_logits(
+                logits_t2i, targets_t2i, pos_weight=self.pos_weight_tensor.to(device), reduction="mean"
+            )
+        else:
+            loss_t2i = F.binary_cross_entropy_with_logits(
+                logits_t2i, targets_t2i, reduction="mean"
+            )
+
+        return 0.5 * (loss_i2t + loss_t2i)
+
+def train_epoch_adapter_only(train_loader, model, optimizer, criterion, device, text_features, epoch, adapter, scheduler, gamma, k,  alpha=0.2, beta=0.1, itc_temp=0.07, k_itc=None):
     """
      Train the Emotion-aware Adapter on top of frozen CLIP visual encoder.
     Use fixed text_features for classification.
@@ -128,20 +208,16 @@ def train_epoch_last_block(train_loader, model, optimizer, criterion, device, te
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}")
     sample_logged = False
     scale2 = model.logit_scale.exp()
-    print("Logit scale (TO TEST):", scale2.item())
+    mp_criterion = MultiPositiveContrastiveLoss(temperature=0.07, symmetric=True, pos_weight=20.0)
 
     for images, labels, per_image_text in progress_bar:
         images = images.to(device, non_blocking=True).float()
         labels = labels.to(device, non_blocking=True)
-        desc_tokens = clip.tokenize(per_image_text)
-        desc_tokens = desc_tokens.to(device, non_blocking=True)
-
         optimizer.zero_grad(set_to_none=True)
 
         with torch.no_grad():
             patch_tokens_768 = extract_patch_tokens(model, images)  # [B, N+1, 768]
-
-        tokens_512 = project_visual_tokens(model, patch_tokens_768).to(device)  # [B, N+1, 512]
+            tokens_512 = project_visual_tokens(model, patch_tokens_768).to(device)  # [B, N+1, 512]
 
         tokens = adapter(tokens_512)  # [B, N+1, 512]
         v_cls = tokens[:, 0, :]  # [B, 512]
@@ -151,20 +227,32 @@ def train_epoch_last_block(train_loader, model, optimizer, criterion, device, te
         logits = mfd_fused_logits_from_features(v_cls, v_patches, text_features, scale, k=k, gamma=gamma)
         loss_ce = criterion(logits, labels)
 
-        # ----- per-image text embeddings (no_grad) -----
-        loss_itc_global = torch.tensor(0.0, device=device)
-        loss_itc_local = torch.tensor(0.0, device=device)
-        print(desc_tokens)
-        print(per_image_text)
-        if desc_tokens is not None:
-            with torch.no_grad():
-                t_img = encode_text_batch(model, desc_tokens)  # [B, 512], L2-normed
+        # ----- per-image multi-positive text embeddings (ITC) -----
+        # per_image_text can be: List[List[str]] (preferred) or List[str]
+        all_texts = []
+        pos_index = []  # list of LongTensors; pos_index[i] -> indices in all_texts that belong to image i
+        offset = 0
+        for t in per_image_text:
+            texts_i = t if isinstance(t, (list, tuple)) else [t]
+            if not texts_i:
+                texts_i = ["a face with an unspecified expression"]
+            n_i = len(texts_i)
+            print(f'texts {n_i}')
+            all_texts.extend(texts_i)
+            pos_index.append(torch.arange(offset, offset + n_i, dtype=torch.long, device=device))
+            offset += n_i
 
-            # global ITC: v_cls ↔ t_img
-            loss_itc_global = clip_itc_loss(v_cls, t_img, temp=itc_temp)
+        # Tokenize & encode all captions for the batch
+        desc_tokens = clip.tokenize(all_texts).to(device, non_blocking=True)
+        with torch.no_grad():
+            txt_embeds = encode_text_batch(model, desc_tokens)  # (M, 512), L2-normalized inside encode_text_batch
+
+        # Compute multi-positive contrastive loss (image->text and text->image)
+        # mp_criterion = MultiPositiveContrastiveLoss(temperature=itc_temp, symmetric=True, pos_weight=pos_w)
+        loss_itc_global = mp_criterion(v_cls, txt_embeds, pos_index)
 
         # ----- total loss -----
-        loss = loss_ce + alpha * loss_itc_global + beta * loss_itc_local
+        loss = loss_ce + alpha * loss_itc_global
 
         # ===== anomaly checks (fail fast) =====
         if not torch.isfinite(loss):
@@ -523,7 +611,7 @@ def train():
     for epoch in range(config['num_epochs']):
         print(f"Epoch {epoch + 1}/{config['num_epochs']}")
 
-        train_loss, train_accuracy = train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch, adapter, scheduler, gamma, k)
+        train_loss, train_accuracy = train_epoch_adapter_only(train_loader, model, optimizer, criterion, device, text_features, epoch, adapter, scheduler, gamma, k)
         val_loss, val_acc, val_f1, val_cm, val_pc, val_mca, support = evaluate_last_block(val_loader, model, device, criterion, config['num_classes'], text_features, epoch, adapter, gamma, k)
 
         print("Current LR:", scheduler.get_last_lr()[0])

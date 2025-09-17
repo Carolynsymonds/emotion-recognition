@@ -8,16 +8,6 @@ import clip
 from torch.utils.data import random_split
 
 
-labels_map = {
-    '0' : 'Anger',
-    '1' : 'Contempt',
-    '2' : 'Disgust',
-    '3' : 'Fear',
-    '4' : 'Happy',
-    '5' : 'Neutral',
-    '6' : 'Sad',
-    '7' : 'Surprise'
-}
 labels_map_full = {
     0: "Neutral",
     1: "Happiness",
@@ -190,7 +180,7 @@ def get_data_loaders_clip(config, device):
 
     print(f'training dataa! data')
 
-    train_loader = DataLoader(train_subset, batch_size=256, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_subset, batch_size=256, shuffle=False, num_workers=4)
+    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=4)
 
     return train_loader, val_loader, []

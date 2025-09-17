@@ -362,7 +362,7 @@ def train():
         print(f"Epoch {epoch + 1}/{config['num_epochs']}")
 
         train_loss, train_accuracy = train_epoch_last_block(train_loader, model, optimizer, config['num_classes'], device, text_features, epoch, mfd_edl)
-        val_loss, val_acc, val_f1, val_cm, val_pc, val_mca = evaluate_last_block(val_loader, model, device, criterion, config['num_classes'], text_features, mfd_edl)
+        val_loss, val_acc, val_f1, val_cm, val_pc, val_mca = evaluate_last_block(val_loader, model, device, config['num_classes'], text_features, mfd_edl)
 
         scheduler.step(val_loss)
 

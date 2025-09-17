@@ -380,8 +380,8 @@ def train():
     config = load_config('config.yaml')
     device = setup_device()
 
-    gamma = config.get("gamma", 0.3)
-    k = config.get("topk", 16)
+    gamma = config.get("gamma", 0.4)
+    k = config.get("topk", 32)
 
     print(f"Training for gamma {gamma} and topk {k} ")
     print(f"Training for {config['num_epochs']} epochs")
@@ -468,7 +468,6 @@ def train():
     #THIS IS FOR DEBUG
 
     # 5 - Training loop
-    best_val_loss = float('inf')
     best_mca = -float('inf')
     patience = 5
     early_stopping_counter = 0
