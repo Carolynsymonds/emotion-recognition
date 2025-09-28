@@ -10,6 +10,8 @@ from utils import load_config, setup_device, plot_metrics
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from matplotlib import cm
 
 class EvidenceExtractor(nn.Module):
     def __init__(self,
@@ -58,38 +60,6 @@ class EvidenceExtractor(nn.Module):
 def update_ema(val, ema, alpha=0.1):
     return val if ema is None else (alpha * val + (1 - alpha) * ema)
 
-def encode_images_trainable(model, images):
-    feats = model.encode_image(images)                # grads flow into last block
-    feats = feats / feats.norm(dim=-1, keepdim=True)  # L2 norm
-    return feats
-
-
-def compute_affinities(v_cls, v_patches, text_features, temp):
-    # Normalize embeddings
-    v_cls = F.normalize(v_cls, dim=-1)          # [B, D]
-    v_patches = F.normalize(v_patches, dim=-1)  # [B, N, D]
-    text_features = F.normalize(text_features, dim=-1)  # [C, D]
-
-    # Global affinities: [B, C]
-    logits_global = torch.matmul(v_cls, text_features.t()) / temp
-
-    # Local affinities: [B, N, C]
-    logits_local = torch.matmul(v_patches, text_features.t()) / temp
-
-    # Temperature scaling and softmax along class dimension
-    affinity_global = torch.softmax(logits_global, dim=-1)  # [B, C]
-    affinity_local = torch.softmax(logits_local, dim=-1)    # [B, N, C]
-
-    return affinity_global, affinity_local
-
-def topk_local_affinity(affinity_local, k=16):
-    # affinity_local: [B, N, C], topk over N patches
-    topk_values, _ = torch.topk(affinity_local, k=k, dim=1)  # [B, k, C]
-    affinity_local_decoupled = topk_values.mean(dim=1)       # mean over top-K, shape [B, C]
-    return affinity_local_decoupled
-def combine_affinities(affinity_global, affinity_local_decoupled, gamma=0.3):
-    combined_affinity = gamma * affinity_global + (1 - gamma) * affinity_local_decoupled  # [B, C]
-    return combined_affinity
 def kl_dirichlet(alpha):
     # KL( Dir(alpha) || Dir(1) ) ; stable, mean over batch
     S   = alpha.sum(1, keepdim=True)
@@ -99,91 +69,50 @@ def kl_dirichlet(alpha):
     dig   = torch.digamma(alpha) - torch.digamma(S)
     kl = (logB - logB0).squeeze(1) + ((alpha - 1.0) * dig).sum(1)
     return kl.mean()
-def mfd_fused_logits_from_features(v_cls, v_patches, text_features, scale, k=16, gamma=0.3):
+def ruc_loss(p_list, u_list, labels, num_classes, eps=1e-8, reduce='mean'):
     """
-    v_cls:     [B, D]    (CLS after adapter; D=512 in your setup)
-    v_patches: [B, N, D] (patch tokens after adapter)
-    text_features: [C, D] (L2-normalized)
-    scale: CLIP logit scale, i.e., model.logit_scale.exp()
-    returns: fused logits [B, C] suitable for CrossEntropyLoss
+    Relation Uncertainty Calibration loss (Eq. 13).
+    p_list: list of [B, C] tensors (Dirichlet means per relation).
+    u_list: list of [B] or [B,1] tensors (uncertainty mass per relation).
     """
-    # L2-normalize visual features (text already normalized)
-    v_cls     = F.normalize(v_cls, dim=-1)
-    v_patches = F.normalize(v_patches, dim=-1)
-    t         = F.normalize(text_features, dim=-1)
+    assert len(p_list) == len(u_list) and len(p_list) > 0
+    device = labels.device
+    B, C = labels.size(0), num_classes
 
-    # Global logits (standard CLIP): scale * cosine
-    logits_cls = scale * (v_cls @ t.t())                                # [B, C]
-
-    # Local logits per patch
-    logits_loc = scale * (v_patches @ t.t().unsqueeze(0))               # [B, N, C]
-
-    # Per-patch class probs, then Top-K over patches per class
-    A_loc = torch.softmax(logits_loc, dim=-1)        # [B, N, C]
-    A_loc_bcn = A_loc.permute(0, 2, 1)               # [B, C, N]
-    k_eff = min(k, A_loc_bcn.shape[-1])
-    topk_vals = torch.topk(A_loc_bcn, k=k_eff, dim=2).values            # [B, C, k]
-    A_loc_mean = topk_vals.mean(dim=2).clamp_min(1e-8)                  # [B, C]
-
-    # Fuse in logit space (numerically stable): logits + log(prob)
-    fused_logits = gamma * logits_cls + (1.0 - gamma) * torch.log(A_loc_mean)
-    return fused_logits
-def ruc_loss(p_list, u_list, labels, num_classes, eps=1e-8):
-    """
-    Implements Eq. (13):
-    L_RUC = - 1/N * sum_i [ sum_{j in correct}   p_i^(j) * log(1 - u_i^(j))
-                           + (1/C) * sum_{j in wrong} (1 - p_i^(j)) * log(u_i^(j)) ]
-
-    Args:
-      p_list: list of tensors, each [B, C], expected class probs for each relation (e.g., [p_g, p_l]).
-      u_list: list of tensors, each [B] or [B,1], uncertainty scalars for each relation (u = C / sum(alpha)).
-      labels: LongTensor [B].
-      num_classes: int, C.
-    """
-    assert len(p_list) == len(u_list)
-    B = labels.size(0)
-    C = num_classes
-
-    total_correct_term = 0.0
-    total_wrong_term   = 0.0
+    correct_accum = torch.tensor(0.0, device=device)
+    wrong_accum   = torch.tensor(0.0, device=device)
+    R = float(len(p_list))  # number of relations
 
     for p, u in zip(p_list, u_list):
         if u.dim() == 2:
-            u = u.squeeze(1)                      # [B]
+            u = u.squeeze(1)  # [B]
 
-        # relation's predicted label and its probability
-        yhat = p.argmax(dim=1)                    # [B]
-        p_pred = p.gather(1, yhat.unsqueeze(1)).squeeze(1)  # [B]
+        # predicted class & its probability
+        yhat   = p.argmax(dim=1)                           # [B]
+        p_pred = p.gather(1, yhat.unsqueeze(1)).squeeze(1) # [B]
 
-        # masks: which samples this relation predicts correctly / wrongly
-        correct = (yhat == labels)                # [B] bool
+        # masks
+        correct = (yhat == labels)
         wrong   = ~correct
 
-        # clamp for numerical safety
-        u_clamp = u.clamp(min=eps, max=1 - eps)
+        # clamps
+        u = u.clamp(min=eps, max=1.0 - eps)
+        p_pred = p_pred.clamp(min=eps, max=1.0 - eps)
 
-        # terms from Eq. (13)
+        # per-relation normalized terms (avoid skew when few samples qualify)
         if correct.any():
-            total_correct_term += (p_pred[correct] * torch.log(1.0 - u_clamp[correct])).sum()
+            term_c = (p_pred[correct] * torch.log(1.0 - u[correct])).mean()
+            correct_accum = correct_accum + term_c
         if wrong.any():
-            total_wrong_term   += ((1.0 - p_pred[wrong]) * torch.log(u_clamp[wrong])).sum()
+            term_w = ((1.0 - p_pred[wrong]) * torch.log(u[wrong])).mean()
+            wrong_accum = wrong_accum + term_w
 
-    # average over batch; wrong term normalized by C (the equation’s 1/C factor)
-    L = -( total_correct_term + (total_wrong_term / C) ) / max(1, B)
-    return L
+    # average over relations; apply 1/C factor to the wrong term (per Eq. 13)
+    loss = -( correct_accum / R + (wrong_accum / R) / C )
 
-def KL(alpha):
-    K = alpha.size(1)
-    beta = torch.ones((1, K), device=alpha.device)
-    S_alpha = torch.sum(alpha, dim=1, keepdim=True)
-    KL_div = (
-        torch.lgamma(S_alpha).sum()
-        - torch.lgamma(alpha).sum(dim=1).sum()
-        + torch.lgamma(beta).sum()
-        - torch.lgamma(torch.sum(beta, dim=1))
-        + ((alpha - beta) * (torch.digamma(alpha) - torch.digamma(S_alpha))).sum(dim=1)
-    )
-    return KL_div.mean()
+    if reduce == 'sum':
+        loss = loss * B  # optional
+    return loss
 def project_visual_tokens(clip_model, tokens_768):
     x = clip_model.visual.ln_post(tokens_768)
     if clip_model.visual.proj is not None:
@@ -198,14 +127,20 @@ def train_epoch_last_block(train_loader, model, class_weights, optimizer, device
     adapter.train()  # Train adapter
     evidence_extractor_g.train()
 
-    running_loss, correct, total = 0.0, 0, 0
+    # hygiene
+    assert text_features.size(0) == num_classes
+    class_weights = class_weights.to(device).float()
+
+    running_loss, correct, n_seen = 0.0, 0, 0
     ema_loss, ema_acc = None, None
+    with torch.no_grad():
+        text_features = F.normalize(text_features, dim=1)
+    text_features.requires_grad_(False)
 
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}")
     sample_logged = False
     lambda_kl_max = 0.001
     lambda_ruc = 0.05
-
     # Anneal lambda_kl (warm-up over 10 epochs)
     lambda_kl = min(lambda_kl_max * (epoch / 10), lambda_kl_max)
 
@@ -215,6 +150,7 @@ def train_epoch_last_block(train_loader, model, class_weights, optimizer, device
     for step, (images, labels) in enumerate(progress_bar):
         images = images.to(device, non_blocking=True).float()
         labels = labels.to(device, non_blocking=True)
+
         optimizer.zero_grad(set_to_none=True)
 
         # ----- Frozen CLIP feature extraction -----
@@ -229,58 +165,62 @@ def train_epoch_last_block(train_loader, model, class_weights, optimizer, device
         # ----- Global logits -----
         scale = model.logit_scale.exp()
         logits_g = scale * (F.normalize(v_cls, dim=1) @ text_features.t())  # [B, C]
-        C = text_features.size(0)
 
-        # ----- Evidence (global) -----
-        e_g = evidence_extractor_g(logits_g)  # [B, C], Softplus inside
-        alpha_g = e_g + 1.0  # Dirichlet params
-        Sg = alpha_g.sum(1, keepdim=True)  # [B, 1]
-        p_g = alpha_g / Sg  # expected probs [B, C]
-        u_g = C / Sg  # uncertainty [B, 1]
+        # ----- Evidential (global) -----
+        e_g = F.softplus(evidence_extractor_g(logits_g))  # ensure e >= 0
+        alpha_g = e_g + 1.0
+        Sg = alpha_g.sum(1, keepdim=True)
+        p_g = (alpha_g / Sg).clamp_min(1e-8)
+        u_g = (num_classes / Sg).clamp(1e-6, 1-1e-6)
 
         # ----- Losses -----
         edl_ce = F.nll_loss(torch.log(p_g + 1e-8), labels, weight=class_weights)
         edl_kl = kl_dirichlet(alpha_g)
         L_EDL = edl_ce + lambda_kl * edl_kl
 
-        # RUC (Eq. 13) with only the global relation
-        L_RUC = ruc_loss([p_g], [u_g], labels, num_classes=C)
-
+        # RUC (global-only)
+        L_RUC = ruc_loss([p_g], [u_g], labels, num_classes=num_classes)
         loss = L_EDL + lambda_ruc * L_RUC
 
-        # ----- Backward & optimize -----
+        # ----- Backward -----
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(adapter.parameters()) + list(evidence_extractor_g.parameters()),
-            1.0
-        )
+        torch.nn.utils.clip_grad_norm_(list(adapter.parameters()) +
+                                       list(evidence_extractor_g.parameters()), 1.0)
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
 
-        # ----- Metrics (use calibrated probs) -----
+        # ----- Metrics -----
         running_loss += loss.item() * images.size(0)
-        preds = p_g.argmax(dim=1)
+        preds = p_g.argmax(dim=1)  # stay on device
         correct += (preds == labels).sum().item()
-        total += labels.size(0)
+        n_seen += labels.size(0)
+
+        # histogram (CPU)
+        epoch_pred_counts += torch.bincount(preds.cpu(), minlength=num_classes)
 
         batch_acc = (preds == labels).float().mean().item()
         ema_loss = update_ema(loss.item(), ema_loss)
         ema_acc = update_ema(batch_acc, ema_acc)
 
-
         if step % 100 == 0:
-            print("Pred counts per class (so far):", epoch_pred_counts.tolist())
-            perc = (epoch_pred_counts.float() / epoch_pred_counts.sum()).tolist()
-            print("Pred % (so far):", [round(100 * p, 1) for p in perc])
+            print("Predicted class:", preds[0].item())
+            print("Class probabilities:", p_g[0].detach().cpu().numpy())
+            print("Uncertainty:", float(u_g[0].detach().cpu()))
+
+            total_so_far = int(epoch_pred_counts.sum().item())
+            if total_so_far > 0:
+                perc = (epoch_pred_counts.float() / total_so_far * 100.0).tolist()
+                print("Pred counts per class (so far):", epoch_pred_counts.tolist())
+                print("Pred % (so far):", [round(p, 1) for p in perc])
 
         if not sample_logged:
             print("Sample labels:", labels[:5].tolist())
             print("Sample predictions:", preds[:5].tolist())
             top3 = torch.topk(p_g, k=3, dim=1)
             for i in range(min(5, images.size(0))):
-                print(
-                    f"Label: {labels[i].item()}, Top-3: {top3.indices[i].tolist()}, Scores: {top3.values[i].tolist()}")
+                print(f"Label: {labels[i].item()}, Top-3: {top3.indices[i].tolist()}, "
+                      f"Scores: {top3.values[i].tolist()}")
             sample_logged = True
 
         progress_bar.set_postfix({
@@ -290,10 +230,24 @@ def train_epoch_last_block(train_loader, model, class_weights, optimizer, device
             'lr': optimizer.param_groups[0]['lr']
         })
 
-    print("Pred counts per class (epoch):", epoch_pred_counts.tolist())
+    # ----- DDP reduce histogram (and optionally accuracy) -----
+    if torch.distributed.is_initialized():
+        counts = epoch_pred_counts.to(device)
+        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        epoch_pred_counts = counts.cpu()
 
-    epoch_loss = running_loss / max(1, total)
-    accuracy   = correct / max(1, total)
+        # optional: global accuracy (uncomment if needed)
+        # buf = torch.tensor([correct, n_seen], device=device, dtype=torch.long)
+        # torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+        # correct, n_seen = int(buf[0].item()), int(buf[1].item())
+
+    total_preds = int(epoch_pred_counts.sum().item())
+    perc_epoch = (epoch_pred_counts.float() / max(1, total_preds) * 100.0).tolist()
+    print("Pred counts per class (epoch):", epoch_pred_counts.tolist())
+    print("Pred % (epoch):", [round(p, 1) for p in perc_epoch])
+
+    epoch_loss = running_loss / max(1, n_seen)
+    accuracy = correct / max(1, n_seen)
     return epoch_loss, accuracy
 
 def mean_class_accuracy(per_class_acc):
@@ -304,87 +258,105 @@ def mean_class_accuracy(per_class_acc):
 @torch.no_grad()
 def evaluate_last_block_global(
     val_loader, model, device, num_classes, text_features,
-    adapter, evidence_extractor
+    adapter, evidence_extractor, class_weights=None,
+    lambda_kl: float = 0.0, lambda_ruc: float = 0.0
 ):
-    """
-    Evaluation for last-block setup with global-only RUC.
-    Uses CLIP CLS->text global logits, then evidence->Dirichlet.
-    Returns metrics using calibrated probs (expected Dirichlet).
-    """
-    model.eval()
-    adapter.eval()
-    evidence_extractor.eval()
+    model.eval(); adapter.eval(); evidence_extractor.eval()
 
-    lambda_kl = 0.0
-    lambda_ruc = 0.0
+    assert text_features.size(0) == num_classes
+    text_features = F.normalize(text_features.to(device), dim=1)
 
-    assert text_features.size(0) == num_classes, \
-        f"num_classes ({num_classes}) must match text_features.size(0) ({text_features.size(0)})"
-    text_features = F.normalize(text_features.to(device), dim=1)  # ensure L2-norm
+    scale = model.logit_scale.exp()
+    C = num_classes
 
     val_loss, correct, total = 0.0, 0, 0
     all_preds, all_labels = [], []
-    C = num_classes
-    scale = model.logit_scale.exp()  # scalar tensor
-    epoch_pred_counts = torch.zeros(num_classes, dtype=torch.long)
+    epoch_pred_counts = torch.zeros(num_classes, dtype=torch.long)  # CPU histogram
 
-    with torch.no_grad():
-        for images, labels in val_loader:
-            images = images.to(device).float()
-            labels = labels.to(device)
+    # (optional) class weights for loss comparability with train
+    if class_weights is not None:
+        class_weights = class_weights.to(device).float()
 
-            # ----- Frozen CLIP features -----
-            tokens_768 = extract_patch_tokens(model, images)         # [B, N+1, 768]
-            tokens_512 = project_visual_tokens(model, tokens_768)    # [B, N+1, 512]
+    for images, labels in val_loader:
+        images = images.to(device).float()
+        labels = labels.to(device)
 
-            # ----- Adapter -----
-            tokens = adapter(tokens_512)                             # [B, N+1, 512]
-            v_cls  = tokens[:, 0, :]                                 # [B, 512]
+        # ----- Frozen CLIP features -----
+        t768 = extract_patch_tokens(model, images)       # [B, N+1, 768]
+        t512 = project_visual_tokens(model, t768)        # [B, N+1, 512]
 
-            # ----- Global logits (CLS ↔ text) -----
-            v_cls_n   = F.normalize(v_cls, dim=1)
-            logits_g  = scale * (v_cls_n @ text_features.t())        # [B, C]
+        # ----- Adapter -----
+        tokens = adapter(t512)                           # [B, N+1, 512]
+        v_cls  = tokens[:, 0, :]
 
-            # ----- Evidence -> Dirichlet -----
-            e_g     = evidence_extractor(logits_g)                   # [B, C], Softplus inside
-            alpha_g = e_g + 1.0                                      # [B, C]
-            Sg      = alpha_g.sum(1, keepdim=True)                   # [B, 1]
-            p_g     = alpha_g / Sg                                   # expected probs [B, C]
-            u_g     = C / Sg                                         # uncertainty [B, 1]
+        # ----- Global logits -----
+        v = F.normalize(v_cls, dim=1)
+        logits_g = scale * (v @ text_features.t())      # [B, C]
 
-            # ----- Losses -----
-            ce = F.nll_loss(torch.log(p_g + 1e-8), labels)
-            loss = ce
-            if lambda_kl > 0:
-                loss = loss + lambda_kl * kl_dirichlet(alpha_g)      # or KL(alpha_g) if that's your name
-            if lambda_ruc > 0:
-                loss = loss + lambda_ruc * ruc_loss([p_g], [u_g], labels, num_classes=C)
+        # ----- Evidence -> Dirichlet -----
+        e_g     = evidence_extractor(logits_g)          # [B, C]
+        alpha_g = e_g + 1.0
+        Sg      = alpha_g.sum(1, keepdim=True)
+        p_g     = alpha_g / Sg                           # [B, C]
+        u_g     = C / Sg                                 # [B, 1] (unused unless lambda_ruc>0)
 
-            # ----- Accumulate -----
-            val_loss += loss.item() * images.size(0)
-            preds = p_g.argmax(dim=1)                                # calibrated preds
-            correct += (preds == labels).sum().item()
-            total   += labels.size(0)
-            all_preds.append(preds.cpu())
-            all_labels.append(labels.cpu())
+        # ----- Loss (match train settings if desired) -----
+        ce = F.nll_loss(torch.log(p_g + 1e-8), labels, weight=class_weights) \
+             if class_weights is not None else \
+             F.nll_loss(torch.log(p_g + 1e-8), labels)
 
+        loss = ce
+        if lambda_kl > 0:
+            loss = loss + lambda_kl * kl_dirichlet(alpha_g)
+        if lambda_ruc > 0:
+            loss = loss + lambda_ruc * ruc_loss([p_g], [u_g], labels, num_classes=C)
+
+        # ----- Metrics -----
+        val_loss += loss.item() * images.size(0)
+        preds = p_g.argmax(dim=1)
+        correct += (preds == labels).sum().item()
+        total   += labels.size(0)
+
+        # accumulate for later sklearn metrics
+        all_preds.append(preds.cpu())
+        all_labels.append(labels.cpu())
+
+        # accumulate histogram (CPU)
+        epoch_pred_counts += torch.bincount(preds.cpu(), minlength=num_classes)
+
+    # ---- DDP reductions (optional but recommended) ----
+    if torch.distributed.is_initialized():
+        counts = epoch_pred_counts.to(device)
+        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
+        epoch_pred_counts = counts.cpu()
+
+        buf = torch.tensor([correct, total, val_loss], device=device, dtype=torch.float64)
+        torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+        correct = int(buf[0].item()); total = int(buf[1].item()); val_loss = float(buf[2].item())
+
+    # histogram summary
+    total_preds = int(epoch_pred_counts.sum().item())
+    perc_epoch = (epoch_pred_counts.float() / max(1, total_preds) * 100.0).tolist()
     print("Pred counts per class (validation epoch):", epoch_pred_counts.tolist())
+    print("Pred % (validation epoch):", [round(p, 1) for p in perc_epoch])
 
+    # sklearn-style metrics
     all_preds  = torch.cat(all_preds).numpy()
     all_labels = torch.cat(all_labels).numpy()
 
     val_loss /= max(1, total)
     val_acc   = correct / max(1, total)
 
-    macro_f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
     cm       = confusion_matrix(all_labels, all_preds, labels=np.arange(C))
     support  = cm.sum(axis=1)
     tp       = np.diag(cm).astype(float)
     per_class_acc = np.divide(tp, support, out=np.zeros_like(tp), where=support > 0)
     valid_mask    = (support > 0)
+    macro_f1      = f1_score(all_labels, all_preds, average='macro', zero_division=0)
     mca           = float(per_class_acc[valid_mask].mean()) if valid_mask.any() else 0.0
 
     return val_loss, val_acc, macro_f1, cm, per_class_acc, mca, support
+
 
 
 @torch.no_grad()
@@ -657,12 +629,18 @@ def dump_epoch_predictions_global(
 
 
 @torch.no_grad()
-def probe_label_prompt_alignment(loader, model, adapter, text_features, device, class_names, max_batches=8):
+def probe_label_prompt_alignment(
+    loader, model, adapter, text_features, device, class_names, max_batches=8
+):
     model.eval(); adapter.eval()
     tf = F.normalize(text_features.to(device), dim=1)
     C  = tf.size(0)
+    assert len(class_names) == C, "class_names length must match text_features rows"
+
     scale = model.logit_scale.exp()
-    M = torch.zeros(C, C, dtype=torch.float64)
+
+    # Accumulate on CPU
+    M   = torch.zeros(C, C, dtype=torch.float64)   # [true_label, prompt_idx]
     cnt = torch.zeros(C, dtype=torch.long)
 
     for bi, batch in enumerate(loader):
@@ -670,42 +648,48 @@ def probe_label_prompt_alignment(loader, model, adapter, text_features, device, 
         images = images.to(device).float()
         labels = labels.to(device)
 
+        # frozen CLIP -> adapter -> CLS
         tok_768 = extract_patch_tokens(model, images)
         tok_512 = project_visual_tokens(model, tok_768)
         v_cls   = adapter(tok_512)[:, 0, :]
         v       = F.normalize(v_cls, dim=1)
 
-        probs = (scale * (v @ tf.t())).softmax(dim=1)  # [B, C]
+        # global logits -> softmax over prompts
+        probs = (scale * (v @ tf.t())).softmax(dim=1)  # [B, C], on GPU
+
+        # accumulate per true label (move addend to CPU)
         for i in range(C):
             m = (labels == i)
             if m.any():
-                M[i] += probs[m].sum(dim=0).double()
-                cnt[i] += int(m.sum())
+                M[i] += probs[m].sum(dim=0).double().cpu()
+                cnt[i] += int(m.sum().item())
 
         if bi + 1 >= max_batches:
             break
 
+    # row-normalize by counts
     for i in range(C):
-        if cnt[i] > 0: M[i] /= cnt[i].item()
+        if cnt[i] > 0:
+            M[i] /= cnt[i].item()
 
-    print("\n[Probe] avg prob per (true_label → prompt_index)")
+    # report top-3 per true label
+    print("\n[Probe] avg prob per (true_label → prompt_idx)")
     for i in range(C):
         row = M[i]
         topv, topi = torch.topk(row, k=min(3, C))
-        tops = ", ".join([f"{int(topi[k])}({class_names[int(topi[k])]})={topv[k]:.3f}" for k in range(len(topi))])
+        tops = ", ".join([f"{int(topi[k])}({class_names[int(topi[k])]})={float(topv[k]):.3f}"
+                          for k in range(len(topi))])
         print(f"true {i} ({class_names[i]}): {tops}")
 
     suggested = M.argmax(dim=1).tolist()
     print("\nSuggested mapping (label i → prompt idx):", suggested)
     if suggested == list(range(C)):
         print("✅ Mapping looks correct (identity).")
+    elif sorted(suggested) == list(range(C)):
+        print("⚠️ Mapping is a permutation. You can fix by: text_features = text_features[suggested]")
     else:
-        # If it's a permutation, you can reindex:
-        if sorted(suggested) == list(range(C)):
-            print("⚠️ Reindexing text_features by suggested permutation.")
-            # text_features = text_features[suggested]   # do this if you want to auto-fix
-        else:
-            print("⚠️ Not a permutation. Prompts may be too overlapping; expand templates.")
+        print("⚠️ Not a permutation—prompts likely overlap. Expand/improve templates.")
+
     return M, cnt, suggested
 
 def train():
@@ -713,7 +697,7 @@ def train():
     config = load_config('config.yaml')
     device = setup_device()
 
-    gamma = config.get("gamma", 0.4)
+    gamma = config.get("gamma", 0.1)
     k = config.get("topk", 32)
 
     print(f"Training for gamma {gamma} and topk {k} ")
@@ -801,7 +785,7 @@ def train():
     evidence_extractor = EvidenceExtractor(num_classes, num_classes).to(device)
     optimizer = torch.optim.AdamW(
         list(adapter.parameters()) + list(evidence_extractor.parameters()),
-        lr=1e-4, weight_decay=1e-4
+        lr=config["learning_rate"], weight_decay=1e-4
     )
 
     torch.nn.utils.clip_grad_norm_(
@@ -832,6 +816,7 @@ def train():
 
         train_loss, train_accuracy = train_epoch_last_block(train_loader, model, class_weights, optimizer, device, text_features, epoch, adapter, scheduler, evidence_extractor, config['num_classes'])
         val_loss, val_acc, val_f1, val_cm, val_pc, val_mca, support = evaluate_last_block_global(val_loader, model, device, config['num_classes'], text_features, adapter, evidence_extractor)
+
 
         # after training + validation for the epoch:
         rows = dump_epoch_predictions_global(
@@ -871,7 +856,7 @@ def train():
             mean_class_accuracy=val_mca,
             per_class_accuracy=[float(x) for x in val_pc]
         )
-        metrics_logger.save('metrics.json')
+        metrics_logger.save('metrics_parallel.json')
 
         print(f'best_mca: {best_mca:.4f}')
         print(f'val_mca: {val_mca:.4f}')
@@ -916,6 +901,351 @@ def train():
         'per_class_acc': [float(x) for x in val_pc],
         'config': config,
     }, f"{config['checkpoint_dir']}/last.pth")
+def token_heatmaps_baseline(model, images, text_features):
+    """
+    images: [B,3,H,W] (CLIP-preprocessed)
+    text_features: [C,512], L2-normalized class prototypes (detached)
+    returns:
+      up_hmaps: [B,H,W] heatmaps in [0,1], upsampled to image size
+      pred_cls: [B] predicted class id (same path as training)
+    """
+    model.eval()
+    B, _, H, W = images.shape
+    t = F.normalize(text_features, dim=-1)                     # [C,512]
+    scale = model.logit_scale.exp()
+
+    # ---- Pred class exactly like training (encode_image path) ----
+    img_feats = model.encode_image(images)                     # [B,512]
+    img_feats = F.normalize(img_feats, dim=-1)
+    logits_cls = scale * (img_feats @ t.t())                   # [B,C]
+    pred_cls = logits_cls.argmax(dim=1)                        # [B]
+
+    # ---- Patch tokens for localization ----
+    tokens_768 = extract_patch_tokens(model, images)           # [B,N+1,768]
+    tokens_512 = project_visual_tokens(model, tokens_768)      # [B,N+1,512]
+
+    v_patches = F.normalize(tokens_512[:, 1:, :], dim=-1)      # [B,N,512]
+
+    # Patch→class logits & probs
+    logits_loc = scale * (v_patches @ t.t().unsqueeze(0))      # [B,N,C]
+    probs_loc  = torch.softmax(logits_loc, dim=-1)             # [B,N,C]
+
+    # Select predicted class channel → per-patch score
+    idx = pred_cls.view(-1, 1, 1).expand(-1, probs_loc.size(1), 1)  # [B,N,1]
+    heat = torch.gather(probs_loc, 2, idx).squeeze(-1)         # [B,N]
+
+    # Reshape N → S×S (e.g., 14×14 for ViT-B/16 with 224x224)
+    N = heat.size(1)
+    import math
+    S = int(round(math.sqrt(N)))
+    assert S * S == N, f"Patch count {N} is not a square"
+    heat = heat.view(B, 1, S, S)
+
+    # Normalize each heatmap to [0,1]
+    hmin = heat.amin(dim=(2,3), keepdim=True)
+    hmax = heat.amax(dim=(2,3), keepdim=True)
+    heat = (heat - hmin) / (hmax - hmin + 1e-8)                # [B,1,S,S]
+
+    # Upsample to image size for overlay
+    up_hmaps = F.interpolate(heat, size=(H, W), mode="bilinear", align_corners=False)
+    up_hmaps = up_hmaps.squeeze(1)                              # [B,H,W]
+    return up_hmaps, pred_cls
+
+def overlay_heatmap_aligned(img_CHW: torch.Tensor,
+                            cam_HW: torch.Tensor,
+                            alpha: float = 0.45,
+                            percentile_clip=(60, 99.5),
+                            blur=None):
+    """
+    img_CHW: float tensor [C,H,W] in [0,1] (already unnormalized for display)
+    cam_HW : float tensor [H',W'] CAM (unnormalized). Will be resized to HxW.
+    alpha  : overlay strength
+    percentile_clip: (lo, hi) for robust per-image CAM normalization
+    blur: optional int Gaussian kernel size (odd) for mild smoothing, or None
+    Returns: matplotlib Figure
+    """
+    assert img_CHW.ndim == 3, "img must be [C,H,W]"
+    C, H, W = img_CHW.shape
+
+    # --- Normalize CAM with robust clipping
+    cam = cam_HW.detach().float().cpu().numpy()
+    lo, hi = np.percentile(cam, percentile_clip)
+    cam = np.clip((cam - lo) / (hi - lo + 1e-6), 0, 1)
+
+    # --- Resize CAM to image size
+    # Use matplotlib's imshow resizing by drawing at full size; or do explicit resize:
+    # do explicit resize with numpy + PIL to keep deps minimal
+    try:
+        from PIL import Image
+        cam_img = Image.fromarray((cam * 255).astype(np.uint8))
+        cam_img = cam_img.resize((W, H), resample=Image.BILINEAR)
+        cam = np.asarray(cam_img).astype(np.float32) / 255.0
+    except ImportError:
+        # Fallback: simple np.kron (nearest). (Should almost never hit.)
+        ry, rx = H / cam.shape[0], W / cam.shape[1]
+        cam = np.kron(cam, np.ones((int(np.ceil(ry)), int(np.ceil(rx)))))[0:H, 0:W]
+
+    # --- Optional light blur for nicer blobs
+    if blur and blur > 1 and blur % 2 == 1:
+        try:
+            from scipy.ndimage import gaussian_filter
+            cam = gaussian_filter(cam, sigma=blur/6.0)
+            cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-6)
+        except Exception:
+            pass  # okay to skip if scipy not present
+
+    # --- Colorize CAM (JET) and alpha blend over RGB image
+    jet = cm.get_cmap('jet')
+    heat_rgba = jet(cam)      # [H,W,4], floats in [0,1]
+    heat_rgb = heat_rgba[..., :3]
+
+    img = img_CHW.permute(1, 2, 0).detach().cpu().numpy()  # [H,W,C], [0,1]
+    if C == 1:
+        img = np.repeat(img, 3, axis=2)
+
+    overlay = alpha * heat_rgb + (1 - alpha) * img
+    overlay = np.clip(overlay, 0, 1)
+
+    # --- Plot nicely
+    fig = plt.figure(figsize=(4, 4))
+    plt.imshow(overlay)
+    plt.axis('off')
+    return fig
+
+@torch.no_grad()
+def visualize_one_per_emotion_baseline(val_loader, model, text_features, device,
+                                       class_names=None, alpha=0.45, save_dir=None):
+    model.eval()
+    seen = set()
+    keep_imgs, keep_labels = [], []
+    # references ["7.jpg (5)", "16.jpg (1)", "17.jpg (4)", "36.jpg(3)", "3.jpg (0)", "19.jpg (2)", "47.jpg (6)"]
+    target_names = ["7.jpg", "16.jpg", "17.jpg", "36.jpg", "3.jpg", "19.jpg", "1008.jpg"]
+    from torch.utils.data import Subset
+
+    keep_imgs, keep_labels = [], []
+    ds = val_loader.dataset
+    is_subset = isinstance(ds, Subset)
+    base_ds = ds.dataset if is_subset else ds
+    subset_idxs = ds.indices if is_subset else None
+
+    # Get (path, label) list from the BASE dataset
+    items = getattr(base_ds, "samples", getattr(base_ds, "imgs", None))
+    if items is None:
+        raise AttributeError(
+            "Dataset exposes neither .samples nor .imgs; add a path list to your Dataset."
+        )
+    import os
+    # Map basename -> list of base indices (handle duplicates)
+    name_to_base = {}
+    for bi, (p, lbl) in enumerate(items):
+        name = os.path.basename(p)
+        name_to_base.setdefault(name, []).append(bi)
+
+    # If Subset, build reverse map: base index -> subset index
+    base_to_subset = {b: s for s, b in enumerate(subset_idxs)} if is_subset else None
+
+    # CLIP normalization (only for display reverse)
+    CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+    CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+    def unnorm(x, mean=CLIP_MEAN, std=CLIP_STD):
+        # x: [C,H,W] tensor on CPU
+        if x.dim() != 3:
+            return x
+        m = torch.tensor(mean).view(3, 1, 1)
+        s = torch.tensor(std).view(3, 1, 1)
+        if x.size(0) == 3:
+            return (x * s + m).clamp(0, 1)
+        return x.clamp(0, 1)
+
+    keep_imgs, keep_labels = [], []
+    missing = []
+
+    for target_file in target_names:
+        print("looking for:", target_file)
+        base_idxs = name_to_base.get(target_file, [])
+        if not base_idxs:
+            missing.append(target_file)
+            continue
+
+        # If duplicates exist, we’ll take all that are actually in this split
+        found_any = False
+        for bi in base_idxs:
+            if is_subset:
+                si = base_to_subset.get(bi)
+                if si is None:
+                    # present in base, but not part of this validation subset
+                    continue
+                img_tensor, label = ds[si]
+            else:
+                img_tensor, label = base_ds[bi]
+
+            # Make batch dim and move to device for later model use
+            img_b = img_tensor.unsqueeze(0).to(device)
+            keep_imgs.append(img_b)
+            keep_labels.append(label)
+
+            # Quick visualization (optional)
+            t_disp = unnorm(img_tensor.detach().cpu())
+            plt.figure(figsize=(4, 4))
+            if t_disp.size(0) == 1:
+                plt.imshow(t_disp.squeeze(0), cmap="gray")
+            else:
+                plt.imshow(t_disp.permute(1, 2, 0))
+            plt.axis("off")
+            plt.title(f"{target_file} (label={label})")
+            plt.show()
+
+            found_any = True
+
+        if not found_any:
+            # File exists in base dataset but not in this subset split
+            missing.append(target_file + " (not in this split)")
+
+    if missing:
+        raise FileNotFoundError(f"Not found in this dataset/split: {missing}")
+
+    print(f"Collected {len(keep_imgs)} images.")
+
+    # Collect one per class
+    # for images, labels in val_loader:
+    #     images, labels = images.to(device), labels.to(device)
+    #     for i in range(images.size(0)):
+    #         c = labels[i].item()
+    #         if c not in seen:
+    #             seen.add(c)
+    #             keep_imgs.append(images[i:i+1])  # keep batch dim
+    #             keep_labels.append(c)
+    #     if len(seen) == text_features.size(0):
+    #         break
+
+    if not keep_imgs:
+        print("No samples found for visualization.")
+        return
+
+    # Stack kept images -> [N, C, H, W] (still model-preprocessed)
+    imgs = torch.cat(keep_imgs, dim=0)  # [N, C, H, W]
+
+    # --- Compute heatmaps with your method (must return [N, Hc, Wc]) + preds
+    heatmaps, pred_cls = token_heatmaps_baseline(model, imgs, text_features)  # user-provided
+
+    # --- Unnormalize to [0,1] for display (adjust to your preprocessing!)
+    # If your CLIP preprocessing used mean=0.5, std=0.5:
+    def unnorm(x):  # x: [N,C,H,W]
+        return (x * 0.5 + 0.5).clamp(0, 1)
+
+    imgs_disp = unnorm(imgs)
+
+    import os
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+
+    # --- Show/save each overlay with aligned CAM
+    for i in range(imgs_disp.size(0)):
+        fig = overlay_heatmap_aligned(
+            imgs_disp[i],                  # [C,H,W] in [0,1]
+            heatmaps[i],                   # [Hc,Wc] (unnormalized CAM)
+            alpha=alpha,
+            percentile_clip=(60, 99.5),
+            blur=7                         # try 5 or 7 for look like your target example
+        )
+        gt = keep_labels[i]
+        pred = pred_cls[i].item()
+        title = f"gt={gt} pred={pred}"
+        if class_names:
+            title = f"gt={class_names[gt]} pred={class_names[pred]}"
+        plt.title(title)
+
+        if save_dir:
+            fn = f"class_{gt}_pred_{pred}.png"
+            plt.savefig(os.path.join(save_dir, fn), bbox_inches="tight")
+            plt.close(fig)
+            print("Saved image:", fn)
+        else:
+            plt.show()
+
+def att_heatmap():
+    global device, p
+    config = load_config('config.yaml')
+    device = setup_device()
+    train_loader, val_loader, test_loader = get_data_loaders_clip(config, device)
+    import torch
+    ckpt_path = "./history-3/mfd-adjust/best_model.pth"  # or config['checkpoint_dir']/best_model.pth
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # 1) Recreate the model architecture exactly as during training
+    #    (use your model class + args; you can read ckpt['config'] if helpful)
+    # 2) -- Model: freeze CLIP completely --
+    base_model, preprocess = clip.load("ViT-B/16", device=device)
+    base_model.float()  # force full FP32
+    for p in base_model.parameters():
+        p.data = p.data.float()
+    # Freeze all
+    for p in base_model.parameters():
+        p.requires_grad = False
+    base_model.logit_scale.requires_grad = False  # keep frozen
+    # Unfreeze only the last transformer block of the visual encoder
+    for p in base_model.visual.transformer.resblocks[-1].parameters():
+        p.requires_grad = True
+    # Set fixed temperature τ = 0.07
+    tau = 0.07
+    import math
+    with torch.no_grad():
+        base_model.logit_scale.fill_(math.log(1.0 / tau))
+    # Freeze so it doesn't get updated
+    base_model.logit_scale.requires_grad_(False)
+    # 2) Load checkpoint
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    state = ckpt["model_state_dict"]
+
+    # 3) Strip common prefixes so keys match CLIP's names
+    def strip_prefix(d, prefix):
+        return {k[len(prefix):]: v for k, v in d.items() if k.startswith(prefix)}
+
+    # Try multiple mappings to fit whatever was saved
+    candidates = []
+    # (a) raw
+    candidates.append(state)
+    # (b) remove DataParallel 'module.'
+    if any(k.startswith("module.") for k in state):
+        candidates.append({k.replace("module.", "", 1): v for k, v in state.items()})
+    # (c) if wrapped like 'clip.xxx'
+    if any(k.startswith("clip.") for k in state):
+        s = strip_prefix(state, "clip.")
+        candidates.append(s)
+        if any(k.startswith("module.clip.") for k in state):
+            s = strip_prefix({k.replace("module.", "", 1): v for k, v in state.items()}, "clip.")
+            candidates.append(s)
+    loaded = False
+    for cand in candidates:
+        try:
+            missing, unexpected = base_model.load_state_dict(cand, strict=False)
+            # Heuristic: accept if most params matched
+            if len(missing) + len(unexpected) < 10:
+                print("Loaded with minor mismatches.")
+                if missing:   print("Missing keys:", missing[:10], "...")
+                if unexpected: print("Unexpected keys:", unexpected[:10], "...")
+                loaded = True
+                break
+        except Exception as e:
+            # Try next mapping
+            pass
+    if not loaded:
+        # Last attempt: just report what failed with the raw dict
+        missing, unexpected = base_model.load_state_dict(state, strict=False)
+        print("WARNING: could not confidently align keys.")
+        print("Missing keys:", missing[:20])
+        print("Unexpected keys:", unexpected[:20])
+    base_model.to(device).eval()
+    print("Loaded epoch:", ckpt.get("epoch"))
+    print("Val loss/acc:", ckpt.get("val_loss"), ckpt.get("val_acc"))
+    emotions = ["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"]
+    text_features = build_text_features_mean(by_class_prompt(emotions), base_model, device, emotions).detach()
+    visualize_one_per_emotion_baseline(
+        val_loader, base_model, text_features.to(device), device,
+        class_names=["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"],
+        alpha=0.45, save_dir=f"{config['checkpoint_dir']}/vis_once-5"
+    )
 
 if __name__ == '__main__':
-    train()
+    att_heatmap()
+    # train()

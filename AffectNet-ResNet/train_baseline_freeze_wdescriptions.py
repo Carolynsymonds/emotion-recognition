@@ -1,5 +1,6 @@
 
-from data_baseline_freeze import get_data_loaders_clip
+# from data_baseline_freeze import get_data_loaders_clip
+from data_raf_db import get_data_loaders_clip
 from tqdm import tqdm
 from metrics import MetricsLogger
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -397,159 +398,143 @@ def overlay_heatmap_aligned(img_CHW: torch.Tensor,
     plt.axis('off')
     return fig
 
-@torch.no_grad()
-def visualize_one_per_emotion_baseline(val_loader, model, text_features, device,
-                                       class_names=None, alpha=0.45, save_dir=None):
+import os
+import torch
+import matplotlib.pyplot as plt
+
+# CLIP mean/std (OpenAI)
+_CLIP_MEAN = torch.tensor([0.48145466, 0.4578275,  0.40821073]).view(3,1,1)
+_CLIP_STD  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(3,1,1)
+
+emotions = ["Surprise", "Fear", "Disgust", "Happiness", "Sadness", "Anger", "Neutral"]
+labels_map_full = {
+    1: "Surprise",
+    2: "Fear",
+    3: "Disgust",
+    4: "Happiness",
+    5: "Sadness",
+    6: "Anger",
+    7: "Neutral",
+}
+
+def _unnorm_clip(batch):  # batch: [N,C,H,W] or [C,H,W]
+    # put mean/std on the same device & dtype as batch
+    mean = _CLIP_MEAN.to(device=batch.device, dtype=batch.dtype)
+    std  = _CLIP_STD.to(device=batch.device, dtype=batch.dtype)
+    return (batch * std + mean).clamp(0, 1)
+import os
+import torch
+import matplotlib.pyplot as plt
+
+# OpenAI CLIP normalization stats
+_CLIP_MEAN = torch.tensor([0.48145466, 0.4578275,  0.40821073]).view(3,1,1)
+_CLIP_STD  = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(3,1,1)
+
+def _unnorm_clip(x):  # x: [N,C,H,W] or [C,H,W]
+    mean = _CLIP_MEAN.to(device=x.device, dtype=x.dtype)
+    std  = _CLIP_STD.to(device=x.device, dtype=x.dtype)
+    return (x * std + mean).clamp(0, 1)
+def label_to_name(idx, class_names):
+    """Support 1-based dicts or 0-based lists/tuples."""
+    i = int(idx)
+    if isinstance(class_names, dict):     # 1-based mapping
+        return class_names.get(i + 1, str(i + 1))
+    if isinstance(class_names, (list, tuple)):
+        return class_names[i] if 0 <= i < len(class_names) else str(i)
+    return str(i)
+def visualize_one_per_emotion_baseline(
+    val_loader,
+    model,
+    text_features,
+    device,
+    class_names=None,          # dict mapping label_id -> name
+    alpha=0.45,
+    save_dir=None,
+    specific_filenames=["test_0002_aligned.jpg", "test_0274_aligned.jpg", "test_0007_aligned.jpg", "test_0003_aligned.jpg","test_0001_aligned.jpg", "test_0017_aligned.jpg", "test_2389_aligned"],   # e.g. ["test_0001_aligned.jpg", ...]
+):
+    """
+    Visualize one sample per class with heatmap overlays.
+    Works with RAFDBDatasetCLIP storing samples as (full_path, label) in dataset.samples.
+    If 'specific_filenames' is given, picks those; otherwise picks the first occurrence per class.
+    """
     model.eval()
-    seen = set()
-    keep_imgs, keep_labels = [], []
-
-    # references ["7.jpg (5)", "16.jpg (1)", "17.jpg (4)", "36.jpg(3)", "3.jpg (0)", "19.jpg (2)", "47.jpg (6)"]
-    target_names = ["7.jpg", "218.jpg", "17.jpg", "36.jpg", "3.jpg", "19.jpg", "1008.jpg"]
-    from torch.utils.data import Subset
-
-    keep_imgs, keep_labels = [], []
     ds = val_loader.dataset
-    is_subset = isinstance(ds, Subset)
-    base_ds = ds.dataset if is_subset else ds
-    subset_idxs = ds.indices if is_subset else None
 
-    # Get (path, label) list from the BASE dataset
-    items = getattr(base_ds, "samples", getattr(base_ds, "imgs", None))
-    if items is None:
-        raise AttributeError(
-            "Dataset exposes neither .samples nor .imgs; add a path list to your Dataset."
-        )
-    import os
-    # Map basename -> list of base indices (handle duplicates)
-    name_to_base = {}
-    for bi, (p, lbl) in enumerate(items):
-        name = os.path.basename(p)
-        name_to_base.setdefault(name, []).append(bi)
+    # ---- Build basename -> index map (robust path matching)
+    if not hasattr(ds, "samples"):
+        ds = ds.dataset
+        # raise RuntimeError("Dataset must expose `samples` with file paths (full_path, label).")
 
-    # If Subset, build reverse map: base index -> subset index
-    base_to_subset = {b: s for s, b in enumerate(subset_idxs)} if is_subset else None
+    name2idx = {}
+    for i, (full_path, lbl) in enumerate(ds.samples):
+        base = os.path.basename(full_path)
+        if base not in name2idx:  # keep first occurrence
+            name2idx[base] = i
 
-    # CLIP normalization (only for display reverse)
-    CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
-    CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
-
-    def unnorm(x, mean=CLIP_MEAN, std=CLIP_STD):
-        # x: [C,H,W] tensor on CPU
-        if x.dim() != 3:
-            return x
-        m = torch.tensor(mean).view(3, 1, 1)
-        s = torch.tensor(std).view(3, 1, 1)
-        if x.size(0) == 3:
-            return (x * s + m).clamp(0, 1)
-        return x.clamp(0, 1)
-
-    keep_imgs, keep_labels = [], []
-    missing = []
-
-    for target_file in target_names:
-        print("looking for:", target_file)
-        base_idxs = name_to_base.get(target_file, [])
-        if not base_idxs:
-            missing.append(target_file)
-            continue
-
-        # If duplicates exist, we’ll take all that are actually in this split
-        found_any = False
-        for bi in base_idxs:
-            if is_subset:
-                si = base_to_subset.get(bi)
-                if si is None:
-                    # present in base, but not part of this validation subset
-                    continue
-                img_tensor, label = ds[si]
-            else:
-                img_tensor, label = base_ds[bi]
-
-            # Make batch dim and move to device for later model use
-            img_b = img_tensor.unsqueeze(0).to(device)
-            keep_imgs.append(img_b)
-            keep_labels.append(label)
-
-            # Quick visualization (optional)
-            t_disp = unnorm(img_tensor.detach().cpu())
-            plt.figure(figsize=(4, 4))
-            if t_disp.size(0) == 1:
-                plt.imshow(t_disp.squeeze(0), cmap="gray")
-            else:
-                plt.imshow(t_disp.permute(1, 2, 0))
-            plt.axis("off")
-            plt.title(f"{target_file} (label={label})")
-            plt.show()
-
-            found_any = True
-
-        if not found_any:
-            # File exists in base dataset but not in this subset split
-            missing.append(target_file + " (not in this split)")
-
-    if missing:
-        raise FileNotFoundError(f"Not found in this dataset/split: {missing}")
-
-    print(f"Collected {len(keep_imgs)} images.")
-
-    # Collect one per class
-    # for images, labels in val_loader:
-    #     images, labels = images.to(device), labels.to(device)
-    #     for i in range(images.size(0)):
-    #         c = labels[i].item()
-    #         if c not in seen:
-    #             seen.add(c)
-    #             keep_imgs.append(images[i:i+1])  # keep batch dim
-    #             keep_labels.append(c)
-    #     if len(seen) == text_features.size(0):
-    #         break
-
-    if not keep_imgs:
-        print("No samples found for visualization.")
+    # ---- Decide which indices to visualize
+    indices, labels = [], []
+    if specific_filenames:
+        for name in specific_filenames:
+            idx = name2idx.get(name)
+            if idx is None:
+                print(f"[WARN] Requested file not found in dataset: {name}")
+                continue
+            indices.append(idx)
+            labels.append(ds.samples[idx][1])
+    if not indices:
+        print("No samples selected for visualization.")
         return
 
-    # Stack kept images -> [N, C, H, W] (still model-preprocessed)
-    imgs = torch.cat(keep_imgs, dim=0)  # [N, C, H, W]
+    # ---- Load images (preprocessed) & labels
+    imgs, gts, names = [], [], []
+    for idx in indices:
+        sample = ds[idx]
+        if isinstance(sample, (list, tuple)) and len(sample) == 3:
+            img_tensor, label, fname = sample
+            names.append(fname)
+        else:
+            img_tensor, label = sample
+            names.append(os.path.basename(ds.samples[idx][0]))
+        imgs.append(img_tensor.unsqueeze(0))
+        gts.append(int(label))
 
-    # --- Compute heatmaps with your method (must return [N, Hc, Wc]) + preds
-    heatmaps, pred_cls = token_heatmaps_baseline(model, imgs, text_features)  # user-provided
+    imgs = torch.cat(imgs, dim=0).to(device)     # [N,C,H,W]
+    gts  = torch.tensor(gts, dtype=torch.long, device=device)
 
-    # --- Unnormalize to [0,1] for display (adjust to your preprocessing!)
-    # If your CLIP preprocessing used mean=0.5, std=0.5:
-    def unnorm(x):  # x: [N,C,H,W]
-        return (x * 0.5 + 0.5).clamp(0, 1)
+    # ---- Compute heatmaps + predictions
+    with torch.no_grad():
+        heatmaps, pred_cls = token_heatmaps_baseline(model, imgs, text_features)  # [N,Hc,Wc], [N]
+        imgs_disp = _unnorm_clip(imgs).detach().cpu()
 
-    imgs_disp = unnorm(imgs)
-
-    import os
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
-    # --- Show/save each overlay with aligned CAM
+    # ---- Visualize/save
     for i in range(imgs_disp.size(0)):
+        img_i = imgs_disp[i]                                  # [C,H,W] on CPU
+        hm_i  = heatmaps[i].detach().cpu()                    # [Hc,Wc] on CPU
         fig = overlay_heatmap_aligned(
-            imgs_disp[i],                  # [C,H,W] in [0,1]
-            heatmaps[i],                   # [Hc,Wc] (unnormalized CAM)
-            alpha=alpha,
-            percentile_clip=(60, 99.5),
-            blur=7                         # try 5 or 7 for look like your target example
+            img_i, hm_i, alpha=alpha, percentile_clip=(60, 99.5), blur=7
         )
-        gt = keep_labels[i]
-        pred = pred_cls[i].item()
-        title = f"gt={gt} pred={pred}"
+        gt   = int(gts[i].item())
+        pred = int(pred_cls[i].item()) if torch.is_tensor(pred_cls) else int(pred_cls[i])
+
+        # Safe title lookup even if mapping is mismatched (0-based vs 1-based)
         if class_names:
-            title = f"gt={class_names[gt]} pred={class_names[pred]}"
+            gt_name = label_to_name(gt, class_names)  # +1 handled inside
+            pred_name = label_to_name(pred, class_names)
+            title = f"{names[i]} | gt={gt_name} pred={pred_name}"
+        else:
+            title = f"{names[i]} | gt={gt} pred={pred}"
         plt.title(title)
 
         if save_dir:
-            fn = f"class_{gt}_pred_{pred}.png"
+            fn = f"{os.path.splitext(names[i])[0]}_gt{gt}_pred{pred}.png"
             plt.savefig(os.path.join(save_dir, fn), bbox_inches="tight")
             plt.close(fig)
-            print("Saved image:", fn)
+            print("Saved:", fn)
         else:
             plt.show()
-
 
 import math
 def train():
@@ -587,7 +572,6 @@ def train():
     model.logit_scale.requires_grad_(False)
 
     # ONLY USED FOR EVAL
-    emotions = ["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"]
     # text_features = build_text_features_simple(emotions, model, device)
     text_features = build_text_features_mean(by_class_prompt(emotions), model, device, emotions).detach()
 
@@ -619,8 +603,8 @@ def train():
         # if (epoch + 1) % 2 == 0:  # e.g., every 2 epochs
         visualize_one_per_emotion_baseline(
             val_loader, model, text_features.to(device), device,
-            class_names=["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"],
-            alpha=0.45, save_dir=f"{config['checkpoint_dir']}/vis_once"
+            class_names=labels_map_full,
+            alpha=0.45, save_dir=f"{config['checkpoint_parallel']}/vis_once"
         )
 
         train_loss, train_accuracy = train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch)
@@ -645,7 +629,7 @@ def train():
             mean_class_accuracy=val_mca,
             per_class_accuracy=[float(x) for x in val_pc]
         )
-        metrics_logger.save('metrics.json')
+        metrics_logger.save('metrics_parallel.json')
 
         print(f'best val loss: {best_val_loss:.4f}')
         print(f'val loss: {val_loss:.4f}')
@@ -665,7 +649,7 @@ def train():
                 "per_class_acc": [float(x) for x in val_pc],
                 'config': config,
             }
-            torch.save(ckpt, f"{config['checkpoint_dir']}/best_model.pth")
+            torch.save(ckpt, f"{config['checkpoint_parallel']}/best_model.pth")
             print('Saved Best Model!')
         else:
             early_stopping_counter += 1
@@ -684,11 +668,11 @@ def train():
         'val_mean_class_acc': float(val_mca),
         'per_class_acc': [float(x) for x in val_pc],
         'config': config,
-    }, f"{config['checkpoint_dir']}/last.pth")
+    }, f"{config['checkpoint_parallel']}/last.pth")
 
 def plot():
     metrics_logger = MetricsLogger()
-    metrics_logger.load("./metrics.json")
+    metrics_logger.load("./metrics_parallel.json")
 
     plot_metrics(metrics_logger.get_metrics_history(), "./checkpoints")
 
@@ -766,17 +750,16 @@ def att_heatmap():
     base_model.to(device).eval()
     print("Loaded epoch:", ckpt.get("epoch"))
     print("Val loss/acc:", ckpt.get("val_loss"), ckpt.get("val_acc"))
-    emotions = ["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"]
     text_features = build_text_features_mean(by_class_prompt(emotions), base_model, device, emotions).detach()
     visualize_one_per_emotion_baseline(
         val_loader, base_model, text_features.to(device), device,
-        class_names=["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"],
-        alpha=0.45, save_dir=f"{config['checkpoint_dir']}/vis_once-5"
+        class_names=emotions,
+        alpha=0.45, save_dir=f"{config['checkpoint_parallel']}/vis_once-5"
     )
 
 
 if __name__ == '__main__':
-    att_heatmap()
+    # att_heatmap()
 
-    # train()
+    train()
     # plot()

@@ -766,12 +766,12 @@ def plot_training_metrics(train_loss, mean_class_accuracy, save_path_prefix=None
 
 def plot():
     metrics_logger = MetricsLogger()
-    metrics_logger.load("./history-3/mfd-adjust/mfd_adjust-g-04-k-24/metrics.json")
+    metrics_logger.load("./metrics_parallel.json")
 
     metrics_history = metrics_logger.get_metrics_history()
     plot_per_class_accuracy(metrics_history["per_class_accuracy"], labels_map_full)
     plot_training_metrics(metrics_history["train_loss"], metrics_history["mean_class_accuracy"])
 
 if __name__ == '__main__':
-    train()
-    # plot()
+    # train()
+    plot()

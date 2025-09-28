@@ -33,58 +33,82 @@ class RAFDBDatasetCLIP(Dataset):
     Returns: (image_tensor, label)  or (image_tensor, label, filename) if return_filename=True
     """
     def __init__(
-        self,
-        root: str,                      # e.g., ".../DATASET"
-        split: str,                     # "train" or "test"
-        transform=None,                 # CLIP preprocess (expects PIL)
-        csv_path: Optional[str]=None,   # e.g., ".../DATASET/train_labels.csv" or test_labels.csv
-        label_base: int = 1,            # RAF-DB labels are typically 1..7 → subtract 1 by default
-        exclude_labels: Optional[Iterable[int]] = None,
-        return_filename: bool = False,
-    ):
-        assert split in {"train", "test"}
+            self,
+            root: str,  # e.g. "data/DATASET"
+            split: str,  # "train" or "test"
+            transform=None,  # CLIP preprocess (expects PIL)
+            csv_path: Optional[str] = None,
+            label_base: int = 1,  # RAF-DB labels are usually 1..7
+            to_zero_based: bool = True,  # convert to 0..6 if True
+            exclude_labels: Optional[Iterable[int]] = None,
+            return_filename: bool = False,
+            strict: bool = True
+        ):
         self.root = root
         self.split = split
         self.img_dir = os.path.join(root, split)
         self.transform = transform
         self.return_filename = return_filename
         self.label_base = label_base
+        self.to_zero_based = to_zero_based
         self.exclude_labels = set([]) if exclude_labels is None else set(exclude_labels)
 
-        self.exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-        self.samples = self._load_samples(csv_path)
-
-        # Deterministic order
+        if csv_path is None:
+            csv_path = os.path.join(root, f"{split}_labels.csv")
+        self.samples = self._load_from_csv(csv_path, strict)
+        # deterministic order
         self.samples.sort(key=lambda x: x[0])
+
+        print(f"[{split}] Loaded {len(self.samples)} samples from {os.path.basename(csv_path)}")
 
     def _is_image(self, fname: str) -> bool:
         return os.path.splitext(fname)[1].lower() in self.exts
 
-    def _load_from_csv(self, csv_path: str):
+    def _load_from_csv(self, csv_path: str, strict: bool):
         samples = []
+        missing = 0
+
+        def _clean(s: str) -> str:
+            # strip BOM, spaces, CRLF; keep only basename for safety
+            s = s.replace("\ufeff", "").strip()
+            return os.path.basename(s)
+
         with open(csv_path, "r", newline="") as f:
             reader = csv.reader(f)
             for row in reader:
                 if not row:
                     continue
-                # Handle possible header
-                if re.match(r"(?i)filename", row[0]):
+                # skip header
+                if re.match(r"(?i)\s*image", row[0]):
                     continue
-                filename, label_str = row[0].strip(), row[1].strip()
-                if not self._is_image(filename):
-                    # allow CSV with names lacking ext (unlikely); skip if not an image
-                    pass
-                img_path = os.path.join(self.img_dir, filename)
-                if not os.path.isfile(img_path):
-                    # Try inside possible subfolder (rare); otherwise skip
-                    continue
-                try:
-                    lbl = int(label_str) - self.label_base
-                except ValueError:
-                    continue
-                if lbl in self.exclude_labels:
-                    continue
-                samples.append((filename, lbl))
+
+                filename_raw = row[0]
+                label_str = row[1]
+
+                filename = _clean(filename_raw)
+                label_raw = int(label_str.strip())  # RAF-DB CSV typically 1..7
+                label_idx = label_raw - 1  # store 0..6 for training
+
+                # ONLY allow class-subfolder path: <split>/<label_raw>/<filename>
+                rel_path = os.path.join(str(label_raw).strip(), filename)
+                full_path = os.path.normpath(os.path.join(self.img_dir, rel_path))
+
+                if not os.path.isfile(full_path):
+                    missing += 1
+                    msg = (f"[{self.split}] Missing file for CSV row: "
+                           f"filename={repr(filename_raw)}, label={repr(label_str)}\n"
+                           f" -> tried: {full_path}\n"
+                           f"   img_dir={self.img_dir}")
+                    if strict:
+                        raise FileNotFoundError(msg)
+                    else:
+                        print("[WARN]", msg)
+                        continue
+
+                samples.append((full_path, label_idx))
+
+        print(f"[{self.split}] Loaded {len(samples)} samples from {os.path.basename(csv_path)}"
+              + (f" | missing={missing}" if missing else ""))
         return samples
 
     def _load_from_folders(self):
@@ -121,14 +145,12 @@ class RAFDBDatasetCLIP(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int):
-        rel_path, label = self.samples[idx]
-        img_path = os.path.join(self.img_dir, rel_path)
-        # If test/ is flat (no subfolders), rel_path is just the filename
+        img_path, label = self.samples[idx]
         image = Image.open(img_path).convert("RGB")
         if self.transform is not None:
             image = self.transform(image)
         if self.return_filename:
-            return image, torch.tensor(label, dtype=torch.long), rel_path
+            return image, torch.tensor(label, dtype=torch.long), os.path.basename(img_path)
         return image, torch.tensor(label, dtype=torch.long)
 
 from torchvision import transforms
@@ -243,8 +265,8 @@ def get_data_loaders_clip(config, device):
 
     val_dataset = RAFDBDatasetCLIP(
         root=root,
-        split="train",
-        transform=train_transform,
+        split="test",
+        transform=val_transform,
         csv_path=os.path.join(root, "test_labels.csv"),  # or None to use train/1..7/
         label_base=1,
     )
@@ -265,7 +287,11 @@ def get_data_loaders_clip(config, device):
 
     print(f'training dataa! data')
 
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=4)
+    # plot_class_distribution(val_dataset, labels_map_full, title="Val Class Distribution", save_dir=None,
+    #         filename=None,
+    #         annotate_pct=True)
+    train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4)
+    val_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
+
 
     return train_loader, val_loader, []

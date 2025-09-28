@@ -7,6 +7,10 @@ from torch.utils.data import DataLoader
 import clip
 from torch.utils.data import random_split
 
+from torchvision import transforms
+import matplotlib.pyplot as plt
+from collections import Counter
+import os
 
 labels_map_full = {
     0: "Neutral",
@@ -61,10 +65,6 @@ class AffectNetDatasetCLIP(data.Dataset):
             image = self.transform(image)
         return image, torch.tensor(label)
 
-from torchvision import transforms
-import matplotlib.pyplot as plt
-from collections import Counter
-import os
 
 
 def _to_int(x):
@@ -161,26 +161,26 @@ def get_data_loaders_clip(config, device):
         transforms.Normalize(CLIP_MEAN, CLIP_STD),
     ])
 
-    train_dataset = AffectNetDatasetCLIP(config['train_full'], transform=train_transform, exclude_labels={7})
+    # train_dataset = AffectNetDatasetCLIP(config['train_full'], transform=train_transform, exclude_labels={7})
     val_dataset = AffectNetDatasetCLIP(config['val_full'], transform=val_transform, exclude_labels={7})
 
     # 10% of train set and val set
-    train_len = int(0.1 * len(train_dataset))
+    # train_len = int(0.1 * len(train_dataset))
     val_len = int(0.1 * len(val_dataset))
 
     g = torch.Generator().manual_seed(42)
-    _, train_subset = random_split(train_dataset, [len(train_dataset) - train_len, train_len], generator=g)
+    # _, train_subset = random_split(train_dataset, [len(train_dataset) - train_len, train_len], generator=g)
     _, val_subset = random_split(val_dataset, [len(val_dataset) - val_len, val_len], generator=g)
 
-    print(f'train_set: {len(train_dataset)}')
+    # print(f'train_set: {len(train_dataset)}')
     print(f'val_set: {len(val_dataset)}')
 
-    print(f'train_set - % 10: {len(train_subset)}')
+    # print(f'train_set - % 10: {len(train_subset)}')
     print(f'val_set - % 10: {len(val_subset)}')
 
-    print(f'training dataa! data')
+    print(f'training subset')
 
-    train_loader = DataLoader(train_dataset, batch_size=256, shuffle=True, num_workers=4)
+    # train_loader = DataLoader(train_subset, batch_size=256, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=4)
 
-    return train_loader, val_loader, []
+    return [], val_loader, []
