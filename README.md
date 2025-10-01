@@ -33,6 +33,16 @@ This repository contains experiments for emotion recognition using CLIP backbone
 - **AffectNet**: Large-scale facial expression dataset with 7 emotion classes (Neutral, Happiness, Sadness, Surprise, Fear, Disgust, Anger)
 - **RAF-DB**: Real-world Affective Faces Database with 7 emotion classes
 
+### Dataset Access
+
+**AffectNet Dataset**
+The AffectNet dataset was obtained by request from Mohammad Mahoor (https://www.mohammadmahoor.com/pages/databases/affectnet/). Access requires contacting the dataset owner directly.
+
+**RAF-DB Dataset**
+The RAF-DB dataset was accessed via http://www.whdeng.cn/RAF/model1.html. To obtain access, a password must be requested by emailing Shan Li.
+
+Both datasets include documentation to guide their use and interpretation.
+
 ## Key Features
 
 - **Multi-Feature Decoupling (MFD)**: Combines global and local visual features for robust emotion recognition
