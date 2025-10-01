@@ -1,12 +1,16 @@
 
-from data_baseline_freeze import get_data_loaders_clip
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from src.data.data_affectnet import get_data_loaders_clip
 from tqdm import tqdm
-from metrics import MetricsLogger
+from emotion_recognition.metrics import MetricsLogger
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import clip
 from sklearn.metrics import f1_score, confusion_matrix
 import numpy as np
-from utils import load_config, setup_device, plot_metrics
+from emotion_recognition.utils import load_config, setup_device, plot_metrics
 import torch.nn as nn
 import torch
 import torch.nn.functional as F

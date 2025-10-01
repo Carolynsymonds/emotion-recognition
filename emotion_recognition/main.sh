@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH -D /users/adgs896/inm706_week1/depth-carolyn2/AffectNet-ResNet   # Working directory
+#SBATCH -D /users/adgs896/inm706_week1/depth-carolyn2/emotion_recognition   # Working directory
 #SBATCH --job-name=depth-estimation
 #SBATCH --partition=prigpu
 #SBATCH --nodes=1
@@ -36,4 +36,4 @@ export http_proxy=http://hpc-proxy00.city.ac.uk:3128
 export TORCH_HOME=/mnt/data/public/torch
 
 # Run the script
-python -u train_baseline_freeze.py
+python -u train_mfd_ruc.py

@@ -32,6 +32,7 @@ class AffectNetDatasetCLIP(data.Dataset):
         self.label_dir = os.path.join(img_dir, "annotations")
         self.transform = transform  # CLIP preprocess (expects PIL)
         self.exclude_labels = set([]) if exclude_labels is None else set(exclude_labels)
+        self.exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
         exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
         samples = []
@@ -87,17 +88,10 @@ def plot_class_distribution(
     labels = [_to_int(dataset[i][1]) for i in range(len(dataset))]
     counts = Counter(labels)
 
-    print("labels")
-
-
     # Ensure consistent class order and include zero-count classes
     class_ids = sorted(labels_map.keys())
     classes = [labels_map[i] for i in class_ids]
-
-    print("classes")
-
-    values  = [counts.get(i, 0) for i in class_ids]
-    print("values")
+    values = [counts.get(i, 0) for i in class_ids]
 
 
     # Plot
@@ -120,7 +114,6 @@ def plot_class_distribution(
                 ha="center", va="bottom", fontsize=9
             )
 
-    print(f"Ready to save")
 
     # Save or show
     if save_dir and filename:
@@ -161,26 +154,24 @@ def get_data_loaders_clip(config, device):
         transforms.Normalize(CLIP_MEAN, CLIP_STD),
     ])
 
-    # train_dataset = AffectNetDatasetCLIP(config['train_full'], transform=train_transform, exclude_labels={7})
+    # Load training dataset
+    train_dataset = AffectNetDatasetCLIP(config['train_full'], transform=train_transform, exclude_labels={7})
     val_dataset = AffectNetDatasetCLIP(config['val_full'], transform=val_transform, exclude_labels={7})
 
-    # 10% of train set and val set
-    # train_len = int(0.1 * len(train_dataset))
+    # Use 10% of train set and val set for faster experimentation
+    train_len = int(0.1 * len(train_dataset))
     val_len = int(0.1 * len(val_dataset))
 
     g = torch.Generator().manual_seed(42)
-    # _, train_subset = random_split(train_dataset, [len(train_dataset) - train_len, train_len], generator=g)
+    _, train_subset = random_split(train_dataset, [len(train_dataset) - train_len, train_len], generator=g)
     _, val_subset = random_split(val_dataset, [len(val_dataset) - val_len, val_len], generator=g)
 
-    # print(f'train_set: {len(train_dataset)}')
-    print(f'val_set: {len(val_dataset)}')
+    print(f'Full train_set: {len(train_dataset)}')
+    print(f'Full val_set: {len(val_dataset)}')
+    print(f'Training subset (10%): {len(train_subset)}')
+    print(f'Validation subset (10%): {len(val_subset)}')
 
-    # print(f'train_set - % 10: {len(train_subset)}')
-    print(f'val_set - % 10: {len(val_subset)}')
+    train_loader = DataLoader(train_subset, batch_size=config.get('batch_size', 256), shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_subset, batch_size=config.get('batch_size', 256), shuffle=False, num_workers=4)
 
-    print(f'training subset')
-
-    # train_loader = DataLoader(train_subset, batch_size=256, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=256, shuffle=False, num_workers=4)
-
-    return [], val_loader, []
+    return train_loader, val_loader, []

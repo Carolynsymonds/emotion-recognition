@@ -1,8 +1,7 @@
 
-from data_baseline_freeze import get_data_loaders_clip
+from data_features import get_data_loaders_clip
 from tqdm import tqdm
 from metrics import MetricsLogger
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 import clip
 from sklearn.metrics import f1_score, confusion_matrix
 import numpy as np
@@ -82,7 +81,120 @@ def project_visual_tokens(clip_model, tokens_768):
     if clip_model.visual.proj is not None:
         x = x @ clip_model.visual.proj
     return x
-def train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch, adapter, scheduler, gamma, k):
+
+@torch.no_grad()
+def encode_text_batch(model, desc_tokens):
+    # desc_tokens: LongTensor [B, 77] from clip.tokenize
+    txt = model.encode_text(desc_tokens)
+    return F.normalize(txt, dim=-1)
+
+def clip_itc_loss(img_emb, txt_emb, temp=0.07):
+    # img_emb, txt_emb: [B, D], both L2-normalized
+    logits_i2t = img_emb @ txt_emb.t() / temp
+    logits_t2i = txt_emb @ img_emb.t() / temp
+    targets = torch.arange(img_emb.size(0), device=img_emb.device)
+    loss_i2t = F.cross_entropy(logits_i2t, targets)
+    loss_t2i = F.cross_entropy(logits_t2i, targets)
+    return 0.5 * (loss_i2t + loss_t2i)
+import math
+def grad_norm(params):
+    total = 0.0
+    for p in params:
+        if p.grad is not None:
+            g = p.grad.detach()
+            if torch.isfinite(g).all():
+                total += g.norm(2).item() ** 2
+    return math.sqrt(total)
+
+def tensor_stats(x, name, k=3):
+    x_det = x.detach()
+    finite = torch.isfinite(x_det)
+    return {
+        f'{name}_min': float(x_det[finite].min().item()) if finite.any() else float('nan'),
+        f'{name}_max': float(x_det[finite].max().item()) if finite.any() else float('nan'),
+        f'{name}_mean': float(x_det[finite].mean().item()) if finite.any() else float('nan'),
+    }
+import torch
+import torch.nn.functional as F
+
+class MultiPositiveContrastiveLoss(torch.nn.Module):
+    """
+    Multi-positive CLIP-style contrastive loss.
+
+    Args:
+        temperature (float): softmax temperature (tau). We scale logits by 1/tau.
+        symmetric (bool): if True, compute image->text and text->image losses and average.
+        pos_weight (float or None): optional BCE positive weight to counter class imbalance.
+
+    Forward inputs:
+        img_embeds: (B, D) L2-normalized or will be normalized here
+        txt_embeds: (M, D) where M = sum_i P_i (total captions/text for the batch images)
+        pos_index:  list/tuple length B. pos_index[i] is a 1D LongTensor of indices into txt_embeds
+                    indicating which texts belong to image i (can be variable #positives per image).
+    """
+    def __init__(self, temperature=0.07, symmetric=True, pos_weight=None):
+        super().__init__()
+        self.tau = temperature
+        self.symmetric = symmetric
+        self.register_buffer("pos_weight_tensor",
+                             torch.tensor(pos_weight) if pos_weight is not None else None)
+
+    def forward(self, img_embeds, txt_embeds, pos_index):
+        # Normalize (safe if already normalized)
+        img = F.normalize(img_embeds, dim=-1)
+        txt = F.normalize(txt_embeds, dim=-1)
+
+        # Similarity matrix S = img @ txt^T -> (B, M)
+        logits = (img @ txt.t()) / self.tau   # (B, M)
+
+        # Build multi-hot target matrix Y of shape (B, M)
+        B, M = logits.shape
+        device = logits.device
+        targets = torch.zeros((B, M), dtype=torch.float32, device=device)
+        for i, idx in enumerate(pos_index):
+            targets[i, idx.to(device)] = 1.0
+
+        # BCE-with-logits row-wise: image->text
+        # Optionally weight positives to balance (far fewer positives than negatives)
+        if self.pos_weight_tensor is not None:
+            pos_w = self.pos_weight_tensor.to(device)
+            loss_i2t = F.binary_cross_entropy_with_logits(
+                logits, targets, pos_weight=pos_w, reduction="mean"
+            )
+        else:
+            loss_i2t = F.binary_cross_entropy_with_logits(logits, targets, reduction="mean")
+
+        if not self.symmetric:
+            return loss_i2t
+
+        # Symmetric term: text->image
+        # Build targets^T : (M, B). We need mapping from each text to its owning image.
+        # Derive inverse mapping from pos_index
+        # For each image i, for each text idx in pos_index[i], text2img[idx] = i
+        text2img = torch.full((M,), -1, dtype=torch.long, device=device)
+        for i, idx in enumerate(pos_index):
+            text2img[idx.to(device)] = i
+        assert (text2img >= 0).all(), "Every text must map to exactly one image"
+
+        # logits_t2i: (M, B) = txt @ img^T / tau (or just logits.T)
+        logits_t2i = logits.t()  # (M, B)
+
+        # targets_t2i: one-hot over images for each text
+        targets_t2i = F.one_hot(text2img, num_classes=B).to(torch.float32)  # (M, B)
+
+        if self.pos_weight_tensor is not None:
+            # Here, positives per row = 1; pos_weight still ok to keep symmetry
+            loss_t2i = F.binary_cross_entropy_with_logits(
+                logits_t2i, targets_t2i, pos_weight=self.pos_weight_tensor.to(device), reduction="mean"
+            )
+        else:
+            loss_t2i = F.binary_cross_entropy_with_logits(
+                logits_t2i, targets_t2i, reduction="mean"
+            )
+
+        return 0.5 * (loss_i2t + loss_t2i)
+
+def train_epoch_adapter_only(train_loader, model, optimizer, criterion, device, text_features, epoch, adapter, scheduler, gamma, k,  alpha=0.2, beta=0.1, itc_temp=0.07, k_itc=None):
     """
      Train the Emotion-aware Adapter on top of frozen CLIP visual encoder.
     Use fixed text_features for classification.
@@ -96,45 +208,62 @@ def train_epoch_last_block(train_loader, model, optimizer, criterion, device, te
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch}")
     sample_logged = False
     scale2 = model.logit_scale.exp()
-    print("Logit scale (TO TEST):", scale2.item())
+    mp_criterion = MultiPositiveContrastiveLoss(temperature=0.07, symmetric=True, pos_weight=20.0)
 
-    for images, labels in progress_bar:
+    for images, labels, per_image_text in progress_bar:
         images = images.to(device, non_blocking=True).float()
         labels = labels.to(device, non_blocking=True)
-
         optimizer.zero_grad(set_to_none=True)
 
         with torch.no_grad():
             patch_tokens_768 = extract_patch_tokens(model, images)  # [B, N+1, 768]
+            tokens_512 = project_visual_tokens(model, patch_tokens_768).to(device)  # [B, N+1, 512]
 
-        projected_tokens = project_visual_tokens(model, patch_tokens_768).to(device)  # [B, N+1, 512]
-
-        # Step 1: Forward pass through adapter to get CLS and patch embeddings
-        tokens = adapter(projected_tokens)  # [B, N+1, 512]
+        tokens = adapter(tokens_512)  # [B, N+1, 512]
         v_cls = tokens[:, 0, :]  # [B, 512]
         v_patches = tokens[:, 1:, :]  # [B, N, 512]
 
-        # Step 2: Compute affinities
-        # temp = scale
-        # affinity_global, affinity_local = compute_affinities(v_cls, v_patches, text_features, temp)
         scale = model.logit_scale.exp()
         logits = mfd_fused_logits_from_features(v_cls, v_patches, text_features, scale, k=k, gamma=gamma)
+        loss_ce = criterion(logits, labels)
 
-        # Step 3: Decouple local affinities
-        # affinity_local_decoupled = topk_local_affinity(affinity_local, k=16)
+        # ----- per-image multi-positive text embeddings (ITC) -----
+        # per_image_text can be: List[List[str]] (preferred) or List[str]
+        all_texts = []
+        pos_index = []  # list of LongTensors; pos_index[i] -> indices in all_texts that belong to image i
+        offset = 0
+        for t in per_image_text:
+            texts_i = t if isinstance(t, (list, tuple)) else [t]
+            if not texts_i:
+                texts_i = ["a face with an unspecified expression"]
+            n_i = len(texts_i)
+            print(f'texts {n_i}')
+            all_texts.extend(texts_i)
+            pos_index.append(torch.arange(offset, offset + n_i, dtype=torch.long, device=device))
+            offset += n_i
 
-        # Step 4: Combine global and local affinities
-        # gamma = 0.3  # or dataset-dependent value
-        # combined_logits = combine_affinities(affinity_global, affinity_local_decoupled, gamma)
+        # Tokenize & encode all captions for the batch
+        desc_tokens = clip.tokenize(all_texts).to(device, non_blocking=True)
+        with torch.no_grad():
+            txt_embeds = encode_text_batch(model, desc_tokens)  # (M, 512), L2-normalized inside encode_text_batch
 
-        # Step 5: Compute loss on combined affinity logits (convert back if needed)
-        # epsilon = 1e-8
-        loss = criterion(logits, labels)
+        # Compute multi-positive contrastive loss (image->text and text->image)
+        # mp_criterion = MultiPositiveContrastiveLoss(temperature=itc_temp, symmetric=True, pos_weight=pos_w)
+        loss_itc_global = mp_criterion(v_cls, txt_embeds, pos_index)
+
+        # ----- total loss -----
+        loss = loss_ce + alpha * loss_itc_global
+
+        # ===== anomaly checks (fail fast) =====
+        if not torch.isfinite(loss):
+            print("[ANOMALY] Non-finite loss detected!")
+            print({**tensor_stats(logits, "logits"), **tensor_stats(v_cls, "v_cls")})
+            print("Labels sample:", labels[:8].tolist())
+            raise RuntimeError("Loss is NaN/Inf")
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)  # Grad clipping on adapter params
         optimizer.step()
-
         if scheduler is not None:
             scheduler.step()  # <-- per batch, no args
 
@@ -185,7 +314,7 @@ def mean_class_accuracy(per_class_acc):
     return np.nanmean(per_class_acc)
 
 @torch.no_grad()
-def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_features, adapter, gamma, k):
+def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_features, epoch, adapter, gamma, k):
     """
     Evaluation for last-block fine-tuning setup.
     Uses fixed text_features for classification.
@@ -203,8 +332,12 @@ def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_
 
     scale = model.logit_scale.exp()  # scalar tensor
 
-    for images, labels in val_loader:
-        images, labels = images.to(device), labels.to(device)
+    progress_bar = tqdm(val_loader, desc=f"Epoch {epoch}")
+
+    for images, labels, per_image_text in progress_bar:
+
+        images = images.to(device, non_blocking=True).float()
+        labels = labels.to(device, non_blocking=True)
 
         tokens_768 = extract_patch_tokens(model, images)  # [B, N+1, 768]
         tokens_512 = project_visual_tokens(model, tokens_768)  # [B, N+1, 512]
@@ -212,10 +345,13 @@ def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_
         tokens = adapter(tokens_512)  # [B, N+1, 512]
         v_cls, v_patches = tokens[:, 0, :], tokens[:, 1:, :]  # [B, 512], [B, N, 512]
 
-        logits = mfd_fused_logits_from_features(v_cls, v_patches, text_features, scale, k=k, gamma=gamma)
+        # Fused logits (global + local top-K) against class prototypes only
+        logits = mfd_fused_logits_from_features(
+            v_cls, v_patches, text_features, scale, k=k, gamma=gamma
+        )
         loss = criterion(logits, labels)
 
-        val_loss += loss.item() * images.size(0)
+        val_loss += loss.item() * labels.size(0)
         preds = logits.argmax(dim=1)
         correct += (preds == labels).sum().item()
         total += labels.size(0)
@@ -225,9 +361,6 @@ def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_
 
     all_preds = torch.cat(all_preds).numpy()
     all_labels = torch.cat(all_labels).numpy()
-
-    pred_counts = np.bincount(all_preds, minlength=num_classes)
-    print("Pred counts:", pred_counts.tolist())
 
     val_loss /= max(1, total)
     val_acc = correct / max(1, total)
@@ -365,7 +498,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 def compute_class_counts(train_loader, num_classes: int) -> torch.Tensor:
     """Count labels from the *training* loader on CPU with safe dtypes."""
     counts = torch.zeros(num_classes, dtype=torch.long)
-    for _, y in train_loader:
+    for _, y, _ in train_loader:
         y = y.to('cpu', non_blocking=True).long()
         counts += torch.bincount(y, minlength=num_classes)
     return counts
@@ -383,8 +516,8 @@ def train():
     config = load_config('config.yaml')
     device = setup_device()
 
-    gamma = config.get("gamma", 0.1)
-    k = config.get("topk", 16)
+    gamma = config.get("gamma", 0.4)
+    k = config.get("topk", 24)
 
     print(f"Training for gamma {gamma} and topk {k} ")
     print(f"Training for {config['num_epochs']} epochs")
@@ -419,43 +552,16 @@ def train():
     with torch.no_grad():
         model.logit_scale.fill_(math.log(1.0 / 0.07))  # ≈ 14.29
     model.logit_scale.requires_grad_(False)
-    optimizer = torch.optim.AdamW(adapter.parameters(), lr=config['learning_rate'], weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(adapter.parameters(), lr=1e-4, weight_decay=1e-4)
 
     print("logit_scale.exp =", model.logit_scale.exp().item())
+
+    emotions = ["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"]
+    # text_features = build_text_features_simple(emotions, model, device)
+    text_features = build_text_features_mean(by_class_prompt(emotions), model, device, emotions)
+    text_features = text_features.detach().to(device)  # move to GPU/CPU once
+
     num_classes = config["num_classes"]
-
-    # 0-based, EXACT id order used by your labels:
-    labels_by_id = [
-        "Anger",  # 0
-        "Disgust",  # 1
-        "Fear",  # 2
-        "Happiness",  # 3
-        "Sadness",  # 4
-        "Surprise",  # 5
-        "Neutral",  # 6
-    ]
-    assert num_classes == len(labels_by_id)
-
-    # Use this list directly (no dict lookup mistakes)
-    emotions = labels_by_id
-    print("Label order used for text features:", emotions)
-
-    # If your prompt builder expects lowercase for a/an logic, pass lowercased names there:
-    emotions_lc = [e.lower() for e in emotions]
-    byclass = by_class_prompt(emotions_lc)
-
-    text_features = build_text_features_mean(byclass, model, device, emotions_lc)
-    text_features = text_features.detach().to(device)
-
-    @torch.no_grad()
-    def zero_shot_label_alignment_check(model, text_features):
-        sims = F.normalize(text_features, dim=1) @ F.normalize(text_features, dim=1).t()
-        # this will be nearly identity; more useful is a quick image-text check, but keep this for sanity
-        print("Diag mean (should be ~1):", sims.diag().mean().item())
-        print("Argmax per class (should be 0..C-1):", sims.argmax(dim=1).tolist())
-
-    zero_shot_label_alignment_check(model, text_features)
-
     # 1) Count labels on CPU (full train set)
     counts = compute_class_counts(train_loader, num_classes)  # returns cpu long tensor
     print("Train class counts:", counts.tolist())
@@ -498,15 +604,15 @@ def train():
     #THIS IS FOR DEBUG
 
     # 5 - Training loop
+    best_val_loss = float('inf')
     best_mca = -float('inf')
     patience = 5
     early_stopping_counter = 0
     for epoch in range(config['num_epochs']):
         print(f"Epoch {epoch + 1}/{config['num_epochs']}")
 
-        train_loss, train_accuracy = train_epoch_last_block(train_loader, model, optimizer, criterion, device, text_features, epoch, adapter, scheduler, gamma, k)
-        val_loss, val_acc, val_f1, val_cm, val_pc, val_mca, support = evaluate_last_block(val_loader, model, device, criterion, config['num_classes'], text_features, adapter, gamma, k)
-
+        train_loss, train_accuracy = train_epoch_adapter_only(train_loader, model, optimizer, criterion, device, text_features, epoch, adapter, scheduler, gamma, k)
+        val_loss, val_acc, val_f1, val_cm, val_pc, val_mca, support = evaluate_last_block(val_loader, model, device, criterion, config['num_classes'], text_features, epoch, adapter, gamma, k)
 
         print("Current LR:", scheduler.get_last_lr()[0])
 
@@ -527,7 +633,7 @@ def train():
             mean_class_accuracy=val_mca,
             per_class_accuracy=[float(x) for x in val_pc]
         )
-        metrics_logger.save('metrics_parallel.json')
+        metrics_logger.save('metrics.json')
 
         print(f'best_mca: {best_mca:.4f}')
         print(f'val_mca: {val_mca:.4f}')
@@ -573,56 +679,8 @@ def train():
         'config': config,
     }, f"{config['checkpoint_dir']}/last.pth")
 import matplotlib.pyplot as plt
-def token_heatmaps_baseline(model, images, text_features):
-    """
-    images: [B,3,H,W] (CLIP-preprocessed)
-    text_features: [C,512], L2-normalized class prototypes (detached)
-    returns:
-      up_hmaps: [B,H,W] heatmaps in [0,1], upsampled to image size
-      pred_cls: [B] predicted class id (same path as training)
-    """
-    model.eval()
-    B, _, H, W = images.shape
-    t = F.normalize(text_features, dim=-1)                     # [C,512]
-    scale = model.logit_scale.exp()
 
-    # ---- Pred class exactly like training (encode_image path) ----
-    img_feats = model.encode_image(images)                     # [B,512]
-    img_feats = F.normalize(img_feats, dim=-1)
-    logits_cls = scale * (img_feats @ t.t())                   # [B,C]
-    pred_cls = logits_cls.argmax(dim=1)                        # [B]
-
-    # ---- Patch tokens for localization ----
-    tokens_768 = extract_patch_tokens(model, images)           # [B,N+1,768]
-    tokens_512 = project_visual_tokens(model, tokens_768)      # [B,N+1,512]
-
-    v_patches = F.normalize(tokens_512[:, 1:, :], dim=-1)      # [B,N,512]
-
-    # Patch→class logits & probs
-    logits_loc = scale * (v_patches @ t.t().unsqueeze(0))      # [B,N,C]
-    probs_loc  = torch.softmax(logits_loc, dim=-1)             # [B,N,C]
-
-    # Select predicted class channel → per-patch score
-    idx = pred_cls.view(-1, 1, 1).expand(-1, probs_loc.size(1), 1)  # [B,N,1]
-    heat = torch.gather(probs_loc, 2, idx).squeeze(-1)         # [B,N]
-
-    # Reshape N → S×S (e.g., 14×14 for ViT-B/16 with 224x224)
-    N = heat.size(1)
-    S = int(round(math.sqrt(N)))
-    assert S * S == N, f"Patch count {N} is not a square"
-    heat = heat.view(B, 1, S, S)
-
-    # Normalize each heatmap to [0,1]
-    hmin = heat.amin(dim=(2,3), keepdim=True)
-    hmax = heat.amax(dim=(2,3), keepdim=True)
-    heat = (heat - hmin) / (hmax - hmin + 1e-8)                # [B,1,S,S]
-
-    # Upsample to image size for overlay
-    up_hmaps = F.interpolate(heat, size=(H, W), mode="bilinear", align_corners=False)
-    up_hmaps = up_hmaps.squeeze(1)                              # [B,H,W]
-    return up_hmaps, pred_cls
-
-from data_baseline_freeze import labels_map_full
+from src.data.data_affectnet import labels_map_full
 
 def plot_per_class_accuracy(per_class_accuracy, class_labels=None, title="Per-class Accuracy over Epochs"):
     """
@@ -668,278 +726,52 @@ def plot_per_class_accuracy(per_class_accuracy, class_labels=None, title="Per-cl
     plt.grid(True, linestyle="--", linewidth=0.5, alpha=0.6)
     plt.tight_layout()
     plt.show()
-from matplotlib import cm
+import matplotlib.pyplot as plt
+
+def plot_training_metrics(train_loss, mean_class_accuracy, save_path_prefix=None):
+    """
+    Plot training loss and mean class accuracy over epochs.
+
+    Args:
+        train_loss (list[float]): Training loss per epoch.
+        mean_class_accuracy (list[float]): Mean class accuracy per epoch.
+        save_path_prefix (str | None): If provided, saves figures as
+            f"{save_path_prefix}_loss.png" and f"{save_path_prefix}_mca.png".
+            (Saved to current working directory.)
+    """
+    epochs_loss = range(1, len(train_loss) + 1)
+    epochs_mca  = range(1, len(mean_class_accuracy) + 1)
+
+    # Plot 1: Training Loss
+    plt.figure(figsize=(6, 4))
+    plt.plot(epochs_loss, train_loss, marker='o', linestyle='-')
+    plt.title("Training Loss over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Training Loss")
+    plt.grid(True, linestyle='--', alpha=0.6)
+    if save_path_prefix:
+        plt.savefig(f"{save_path_prefix}_loss.png", bbox_inches="tight", dpi=150)
+    plt.show()
+
+    # Plot 2: Mean Class Accuracy
+    plt.figure(figsize=(6, 4))
+    plt.plot(epochs_mca, mean_class_accuracy, marker='o', linestyle='-')
+    plt.title("Mean Class Accuracy over Epochs")
+    plt.xlabel("Epoch")
+    plt.ylabel("Mean Class Accuracy")
+    plt.grid(True, linestyle='--', alpha=0.6)
+    if save_path_prefix:
+        plt.savefig(f"{save_path_prefix}_mca.png", bbox_inches="tight", dpi=150)
+    plt.show()
 
 def plot():
     metrics_logger = MetricsLogger()
     metrics_logger.load("./metrics_parallel.json")
 
-
     metrics_history = metrics_logger.get_metrics_history()
     plot_per_class_accuracy(metrics_history["per_class_accuracy"], labels_map_full)
-    plot_metrics(metrics_logger.get_metrics_history(), "./checkpoints")
-def overlay_heatmap_aligned(img_CHW: torch.Tensor,
-                            cam_HW: torch.Tensor,
-                            alpha: float = 0.45,
-                            percentile_clip=(60, 99.5),
-                            blur=None):
-    """
-    img_CHW: float tensor [C,H,W] in [0,1] (already unnormalized for display)
-    cam_HW : float tensor [H',W'] CAM (unnormalized). Will be resized to HxW.
-    alpha  : overlay strength
-    percentile_clip: (lo, hi) for robust per-image CAM normalization
-    blur: optional int Gaussian kernel size (odd) for mild smoothing, or None
-    Returns: matplotlib Figure
-    """
-    assert img_CHW.ndim == 3, "img must be [C,H,W]"
-    C, H, W = img_CHW.shape
-
-    # --- Normalize CAM with robust clipping
-    cam = cam_HW.detach().float().cpu().numpy()
-    lo, hi = np.percentile(cam, percentile_clip)
-    cam = np.clip((cam - lo) / (hi - lo + 1e-6), 0, 1)
-
-    # --- Resize CAM to image size
-    # Use matplotlib's imshow resizing by drawing at full size; or do explicit resize:
-    # do explicit resize with numpy + PIL to keep deps minimal
-    try:
-        from PIL import Image
-        cam_img = Image.fromarray((cam * 255).astype(np.uint8))
-        cam_img = cam_img.resize((W, H), resample=Image.BILINEAR)
-        cam = np.asarray(cam_img).astype(np.float32) / 255.0
-    except ImportError:
-        # Fallback: simple np.kron (nearest). (Should almost never hit.)
-        ry, rx = H / cam.shape[0], W / cam.shape[1]
-        cam = np.kron(cam, np.ones((int(np.ceil(ry)), int(np.ceil(rx)))))[0:H, 0:W]
-
-    # --- Optional light blur for nicer blobs
-    if blur and blur > 1 and blur % 2 == 1:
-        try:
-            from scipy.ndimage import gaussian_filter
-            cam = gaussian_filter(cam, sigma=blur/6.0)
-            cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-6)
-        except Exception:
-            pass  # okay to skip if scipy not present
-
-    # --- Colorize CAM (JET) and alpha blend over RGB image
-    jet = cm.get_cmap('jet')
-    heat_rgba = jet(cam)      # [H,W,4], floats in [0,1]
-    heat_rgb = heat_rgba[..., :3]
-
-    img = img_CHW.permute(1, 2, 0).detach().cpu().numpy()  # [H,W,C], [0,1]
-    if C == 1:
-        img = np.repeat(img, 3, axis=2)
-
-    overlay = alpha * heat_rgb + (1 - alpha) * img
-    overlay = np.clip(overlay, 0, 1)
-
-    # --- Plot nicely
-    fig = plt.figure(figsize=(4, 4))
-    plt.imshow(overlay)
-    plt.axis('off')
-    return fig
-
-@torch.no_grad()
-def visualize_one_per_emotion_baseline(val_loader, model, text_features, device,
-                                       class_names=None, alpha=0.45, save_dir=None):
-    model.eval()
-    seen = set()
-    keep_imgs, keep_labels = [], []
-
-    # references ["7.jpg (5)", "16.jpg (1)", "17.jpg (4)", "36.jpg(3)", "3.jpg (0)", "19.jpg (2)", "47.jpg (6)"]
-    paths = ["7.jpg", "16.jpg", "218.jpg", "36.jpg", "3.jpg", "19.jpg", "1008.jpg"]
-
-    keep_imgs, keep_labels = [], []
-
-    for element in paths:
-
-        target_file = element
-        idx = None
-        val_dataset = val_loader.dataset
-
-        for i, (path, _) in enumerate(getattr(val_dataset, "samples", [])):
-            if path == target_file:
-                idx = i
-                print("Found at index:", idx, "label:", val_dataset.samples[i][1])
-                break
-
-        if idx is None:
-            raise FileNotFoundError(f"{target_file} not found in dataset!")
-
-        img_tensor, label = val_dataset[idx]  # (C,H,W), label is int
-        img_tensor = img_tensor.unsqueeze(0).to(device)  # add batch dim
-
-        import torch
-        import matplotlib.pyplot as plt
-
-        # img_tensor: [1, C, H, W] on device
-        t = img_tensor[0].detach().cpu()  # [C,H,W]
-
-        # If you used CLIP/ImageNet style norm; change if different
-        def unnorm(x, mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)):
-            if x.size(0) == 3:
-                m = torch.tensor(mean).view(3, 1, 1)
-                s = torch.tensor(std).view(3, 1, 1)
-                return (x * s + m).clamp(0, 1)
-            elif x.size(0) == 1:
-                return x.clamp(0, 1)
-            return x.clamp(0, 1)
-
-        t_disp = unnorm(t)
-
-        plt.figure(figsize=(4, 4))
-        if t_disp.size(0) == 1:
-            plt.imshow(t_disp.squeeze(0), cmap='gray')
-        else:
-            plt.imshow(t_disp.permute(1, 2, 0))
-        plt.axis('off')
-        plt.title(f"preprocessed (label={label})")
-        plt.show()
-
-        keep_imgs.append(img_tensor)
-        keep_labels.append(label)
-
-    # Collect one per class
-    # for images, labels in val_loader:
-    #     images, labels = images.to(device), labels.to(device)
-    #     for i in range(images.size(0)):
-    #         c = labels[i].item()
-    #         if c not in seen:
-    #             seen.add(c)
-    #             keep_imgs.append(images[i:i+1])  # keep batch dim
-    #             keep_labels.append(c)
-    #     if len(seen) == text_features.size(0):
-    #         break
-
-    if not keep_imgs:
-        print("No samples found for visualization.")
-        return
-
-    # Stack kept images -> [N, C, H, W] (still model-preprocessed)
-    imgs = torch.cat(keep_imgs, dim=0)  # [N, C, H, W]
-
-    # --- Compute heatmaps with your method (must return [N, Hc, Wc]) + preds
-    heatmaps, pred_cls = token_heatmaps_baseline(model, imgs, text_features)  # user-provided
-
-    # --- Unnormalize to [0,1] for display (adjust to your preprocessing!)
-    # If your CLIP preprocessing used mean=0.5, std=0.5:
-    def unnorm(x):  # x: [N,C,H,W]
-        return (x * 0.5 + 0.5).clamp(0, 1)
-
-    imgs_disp = unnorm(imgs)
-
-    import os
-    if save_dir:
-        os.makedirs(save_dir, exist_ok=True)
-
-    # --- Show/save each overlay with aligned CAM
-    for i in range(imgs_disp.size(0)):
-        fig = overlay_heatmap_aligned(
-            imgs_disp[i],                  # [C,H,W] in [0,1]
-            heatmaps[i],                   # [Hc,Wc] (unnormalized CAM)
-            alpha=alpha,
-            percentile_clip=(60, 99.5),
-            blur=7                         # try 5 or 7 for look like your target example
-        )
-        gt = keep_labels[i]
-        pred = pred_cls[i].item()
-        title = f"gt={gt} pred={pred}"
-        if class_names:
-            title = f"gt={class_names[gt]} pred={class_names[pred]}"
-        plt.title(title)
-
-        if save_dir:
-            fn = f"class_{gt}_pred_{pred}.png"
-            plt.savefig(os.path.join(save_dir, fn), bbox_inches="tight")
-            plt.close(fig)
-            print("Saved image:", fn)
-        else:
-            plt.show()
-
-
-import math
-def att_heatmap():
-    global device, p
-    config = load_config('config.yaml')
-    device = setup_device()
-    train_loader, val_loader, test_loader = get_data_loaders_clip(config, device)
-    import torch
-    ckpt_path = "./history-3/mfd-adjust/best_model.pth"  # or config['checkpoint_dir']/best_model.pth
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # 1) Recreate the model architecture exactly as during training
-    #    (use your model class + args; you can read ckpt['config'] if helpful)
-    # 2) -- Model: freeze CLIP completely --
-    base_model, preprocess = clip.load("ViT-B/16", device=device)
-    base_model.float()  # force full FP32
-    for p in base_model.parameters():
-        p.data = p.data.float()
-    # Freeze all
-    for p in base_model.parameters():
-        p.requires_grad = False
-    base_model.logit_scale.requires_grad = False  # keep frozen
-    # Unfreeze only the last transformer block of the visual encoder
-    for p in base_model.visual.transformer.resblocks[-1].parameters():
-        p.requires_grad = True
-    # Set fixed temperature τ = 0.07
-    tau = 0.07
-    with torch.no_grad():
-        base_model.logit_scale.fill_(math.log(1.0 / tau))
-    # Freeze so it doesn't get updated
-    base_model.logit_scale.requires_grad_(False)
-    # 2) Load checkpoint
-    ckpt = torch.load(ckpt_path, map_location="cpu")
-    state = ckpt["model_state_dict"]
-
-    # 3) Strip common prefixes so keys match CLIP's names
-    def strip_prefix(d, prefix):
-        return {k[len(prefix):]: v for k, v in d.items() if k.startswith(prefix)}
-
-    # Try multiple mappings to fit whatever was saved
-    candidates = []
-    # (a) raw
-    candidates.append(state)
-    # (b) remove DataParallel 'module.'
-    if any(k.startswith("module.") for k in state):
-        candidates.append({k.replace("module.", "", 1): v for k, v in state.items()})
-    # (c) if wrapped like 'clip.xxx'
-    if any(k.startswith("clip.") for k in state):
-        s = strip_prefix(state, "clip.")
-        candidates.append(s)
-        if any(k.startswith("module.clip.") for k in state):
-            s = strip_prefix({k.replace("module.", "", 1): v for k, v in state.items()}, "clip.")
-            candidates.append(s)
-    loaded = False
-    for cand in candidates:
-        try:
-            missing, unexpected = base_model.load_state_dict(cand, strict=False)
-            # Heuristic: accept if most params matched
-            if len(missing) + len(unexpected) < 10:
-                print("Loaded with minor mismatches.")
-                if missing:   print("Missing keys:", missing[:10], "...")
-                if unexpected: print("Unexpected keys:", unexpected[:10], "...")
-                loaded = True
-                break
-        except Exception as e:
-            # Try next mapping
-            pass
-    if not loaded:
-        # Last attempt: just report what failed with the raw dict
-        missing, unexpected = base_model.load_state_dict(state, strict=False)
-        print("WARNING: could not confidently align keys.")
-        print("Missing keys:", missing[:20])
-        print("Unexpected keys:", unexpected[:20])
-    base_model.to(device).eval()
-    print("Loaded epoch:", ckpt.get("epoch"))
-    print("Val loss/acc:", ckpt.get("val_loss"), ckpt.get("val_acc"))
-    emotions = ["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"]
-    text_features = build_text_features_mean(by_class_prompt(emotions), base_model, device, emotions).detach()
-    visualize_one_per_emotion_baseline(
-        val_loader, base_model, text_features.to(device), device,
-        class_names=["neutral", "happy", "sad", "surprised", "fearful", "disgusted", "angry"],
-        alpha=0.45, save_dir=f"{config['checkpoint_dir']}/vis_once-5"
-    )
+    plot_training_metrics(metrics_history["train_loss"], metrics_history["mean_class_accuracy"])
 
 if __name__ == '__main__':
-    att_heatmap()
     # train()
-    # plot()
+    plot()

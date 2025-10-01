@@ -1,14 +1,19 @@
 
-from data_baseline_freeze import get_data_loaders_clip
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+from src.data.data_affectnet import get_data_loaders_clip
 from tqdm import tqdm
-from metrics import MetricsLogger
+from emotion_recognition.metrics import MetricsLogger
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import clip
 import torch.nn as nn
 import torch
 from sklearn.metrics import f1_score, confusion_matrix
 import numpy as np
-from utils import load_config, setup_device, plot_metrics
+from emotion_recognition.utils import load_config, setup_device, plot_metrics
+from emotion_recognition.models import build_text_features_simple, build_text_features_mean, by_class_prompt
 
 def update_ema(val, ema, alpha=0.1):
     return val if ema is None else (alpha * val + (1 - alpha) * ema)
@@ -171,54 +176,11 @@ def evaluate_last_block(val_loader, model, device, criterion, num_classes, text_
 
     return val_loss, val_acc, macro_f1, cm, per_class_acc, mca, support
 
-@torch.no_grad()
-def build_text_features_mean(by_class_prompts, model, device, emotions, batch_size=64):
-    """Averages text embeddings across all templates per class."""
-    class_feats = []
-    for cls in emotions:
-        prompts = by_class_prompts[cls]
-        # encode in chunks to avoid OOM
-        feats = []
-        for i in range(0, len(prompts), batch_size):
-            toks = clip.tokenize(prompts[i:i + batch_size]).to(device)
-            emb = model.encode_text(toks)
-            emb = emb / emb.norm(dim=-1, keepdim=True)
-            feats.append(emb)
-        feats = torch.cat(feats, dim=0).mean(dim=0)  # average over templates
-        feats = feats / feats.norm()  # L2 norm
-        class_feats.append(feats)
-    return torch.stack(class_feats, dim=0)  # [num_classes, d]
+# Function moved to models.py
 
-@torch.no_grad()
-def build_text_features_simple(emotions, model, device):
-    """Tokenizes and encodes each emotion label as a CLIP text embedding."""
-    tokens = clip.tokenize(emotions).to(device)
-    text_features = model.encode_text(tokens)
-    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
-    return text_features  # shape: [num_classes, d]
+# Function moved to models.py
 
-def by_class_prompt(emotions):
-    # Classes must match label IDs 0..7
-    templates = [
-        "a photo of a {emotion} face",
-        "a face showing {emotion}",
-        "a person with a {emotion} expression",
-        "a close-up of someone looking {emotion}",
-        "portrait of a {emotion} person",
-    ]
-
-    def a_or_an(word: str) -> str:
-        return "an" if word[0].lower() in "aeiou" else "a"
-
-    by_class = {}
-    for e in emotions:
-        variants = []
-        for t in templates:
-            phr = t.replace("a {emotion}", f"{a_or_an(e)} {{emotion}}").format(emotion=e)
-            variants.append(phr)
-        by_class[e] = variants
-
-    return by_class
+# Function moved to models.py
 
 import math, torch
 import torch.nn.functional as F

@@ -52,6 +52,7 @@ class RAFDBDatasetCLIP(Dataset):
         self.label_base = label_base
         self.to_zero_based = to_zero_based
         self.exclude_labels = set([]) if exclude_labels is None else set(exclude_labels)
+        self.exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
         if csv_path is None:
             csv_path = os.path.join(root, f"{split}_labels.csv")
@@ -179,17 +180,10 @@ def plot_class_distribution(
     labels = [_to_int(dataset[i][1]) for i in range(len(dataset))]
     counts = Counter(labels)
 
-    print("labels")
-
-
     # Ensure consistent class order and include zero-count classes
     class_ids = sorted(labels_map.keys())
     classes = [labels_map[i] for i in class_ids]
-
-    print("classes")
-
-    values  = [counts.get(i, 0) for i in class_ids]
-    print("values")
+    values = [counts.get(i, 0) for i in class_ids]
 
 
     # Plot
@@ -212,7 +206,6 @@ def plot_class_distribution(
                 ha="center", va="bottom", fontsize=9
             )
 
-    print(f"Ready to save")
 
     # Save or show
     if save_dir and filename:
@@ -279,19 +272,16 @@ def get_data_loaders_clip(config, device):
     _, train_subset = random_split(train_dataset, [len(train_dataset) - train_len, train_len], generator=g)
     _, val_subset = random_split(val_dataset, [len(val_dataset) - val_len, val_len], generator=g)
 
-    print(f'train_set: {len(train_dataset)}')
-    print(f'val_set: {len(val_dataset)}')
-
-    print(f'train_set - % 10: {len(train_subset)}')
-    print(f'val_set - % 10: {len(val_subset)}')
-
-    print(f'training dataa! data')
+    print(f'Full train_set: {len(train_dataset)}')
+    print(f'Full val_set: {len(val_dataset)}')
+    print(f'Training subset (10%): {len(train_subset)}')
+    print(f'Validation subset (10%): {len(val_subset)}')
 
     # plot_class_distribution(val_dataset, labels_map_full, title="Val Class Distribution", save_dir=None,
     #         filename=None,
     #         annotate_pct=True)
     train_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=True, num_workers=4)
-    val_loader = DataLoader(train_dataset, batch_size=config['batch_size'], shuffle=False, num_workers=4)
+    val_loader = DataLoader(val_subset, batch_size=config.get('batch_size', 256), shuffle=False, num_workers=4)
 
 
     return train_loader, val_loader, []

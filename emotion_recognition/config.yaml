@@ -1,0 +1,56 @@
+# Data paths
+data: "data"
+dataset: "affectnet"  # Options: "affectnet" or "rafdb"
+
+captions_train: "captions_train.csv"
+captions_val: "captions_val.csv"
+
+#train: "data/YOLO_format/train"
+#val: "data/YOLO_format/valid"
+#test: "data/YOLO_format/test"
+
+#train_full: "/mnt/scratch/users/adgs896/affectnet_upload/train_set"
+#val_full: "/mnt/scratch/users/adgs896/affectnet_upload/val_set"
+#test_full: "/mnt/scratch/users/adgs896/affectnet_upload/test_set"
+
+# Local data paths (for development)
+train_full: "data/datasets/affectnet/train_set"
+val_full: "data/datasets/affectnet/val_set"
+test_full: "data/datasets/affectnet/test_set"
+
+train_raf: "data/datasets/rafdb/train_set"
+test_raf: "data/datasets/rafdb/val_set"
+root: "data/datasets/rafdb"
+
+# Cluster data paths (uncomment for cluster use)
+# train_full: "/mnt/scratch/users/adgs896/affectnet_upload/train_set"
+# val_full: "/mnt/scratch/users/adgs896/affectnet_upload/val_set"
+# test_full: "/mnt/scratch/users/adgs896/affectnet_upload/test_set"
+# train_raf: "/mnt/scratch/users/adgs896/DATASET/train_set"
+# test_raf: "/mnt/scratch/users/adgs896/DATASET/val_set"
+# root: "/mnt/scratch/users/adgs896/DATASET"
+
+
+# Model parameters
+image_size: 256
+batch_size: 128
+num_workers: 4
+num_classes: 7
+#gamma: 0.4
+#k: 24
+
+# Optimized Training parameters
+num_epochs: 30
+learning_rate: 0.0001         # Lower LR = slower, more stable learning (less overfitting)
+weight_decay: 0.05          # Stronger regularization to penalize overly complex models
+scheduler_step_size: 3      # Decay learning rate more frequently
+scheduler_gamma: 0.3        # Decay it more aggressively when triggered
+
+# Output settings
+checkpoint_dir: 'checkpoints-v2'
+checkpoint_parallel: 'checkpoints-v3'
+output_dir: 'outputs/visualizations'
+viz_frequency: 2  # Save visualization every N epochs
+
+# Custom Loss
+alpha: 0.1
