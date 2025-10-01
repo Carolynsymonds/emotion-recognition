@@ -1,4 +1,4 @@
-# Emotion Recognition with CLIP and Multi-Feature Fusion
+# CLIP-FER: Improving Facial Expression Recognition via Feature Decoupling, Contrastive Prompts, and Evidential Uncertainty
 
 This repository contains experiments for emotion recognition using CLIP backbone with different fusion strategies and uncertainty quantification methods.
 
